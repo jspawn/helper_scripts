@@ -1,0 +1,30 @@
+# upstream source clones (huge; clone/build separately, or use submodules)
+llama.cpp-rocm/
+llama.cpp-vulkan/
+stable-diffusion.cpp-rocm/
+stable-diffusion.cpp-vulkan/
+stable-diffusion/          # ignore if this is a cloned/built web UI; keep if it's yours
+
+# virtualenv
+llm-tools/
+
+# models, HF cache, and tokens (large + SECRET)
+models/                    # hub/, xet/, and especially token + stored_tokens (HF auth!)
+
+# training *data* — keep the scripts, drop the corpus
+training/pdfs/             # likely AZEK curriculum — proprietary, don't publish
+training/extracted/
+training/cleaned/
+training/dataset/
+training/qa-pairs/
+training/output/
+
+# runtime / generated
+rag/                       # if this holds a vector store at runtime
+log.txt
+output/
+
+# noise
+__pycache__/
+*.py[co]
+.DS_Store
