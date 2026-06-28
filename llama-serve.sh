@@ -317,6 +317,21 @@ apply_model_preset() {
             SPLIT_MODE="row"; TENSOR_SPLIT="1,1"
             echo -e "  ${CYAN}Preset: Large MoE -- both GPUs, row split, 16K ctx${NC}" ;;
 
+        *[Oo]rnith*35[Bb]*)
+            # Ornith-1.0-35B (Qwen3.5-MoE, RL-trained agentic coder). REASONING
+            # model: jinja on + reasoning-format auto so <think> and <tool_call>
+            # are parsed (code.delegate's sub-agent depends on this). q8_0 KV --
+            # NOT f16 -- so a usable context fits beside the ~28.5GB Q6_K weights
+            # on one 32GB card. Coder role -> GPU1, single GPU. Start at 32K ctx
+            # and raise toward 49152/65536 once gpu.status shows headroom.
+            CTX_SIZE="32768"; TEMP="0.6"; TOP_K="20"; TOP_P="0.95"; MIN_P="0"
+            PRESENCE_PENALTY="0"; REPEAT_PENALTY="1.05"
+            CACHE_TYPE_K="q8_0"; CACHE_TYPE_V="q8_0"
+            REASONING_FORMAT=""          # auto: surface <think> + tool_calls
+            MTP="off"                    # Ornith has no MTP draft head
+            VISIBLE_DEVICES="1"; SPLIT_MODE="none"   # coder on GPU1
+            echo -e "  ${CYAN}Preset: Ornith-1.0-35B -- coder on GPU1, 32K ctx, q8 KV${NC}" ;;
+
         *)
             CTX_SIZE="16384"; TEMP="0.7"; TOP_K="20"; TOP_P="0.95"; MIN_P="0"
             PRESENCE_PENALTY="0"; REPEAT_PENALTY="1.0"
@@ -750,15 +765,30 @@ build_command() {
 #  DRY RUN / RUN
 # ============================================================================
 
+# ROCm device selection must be SINGLE-STAGE. ROCR_VISIBLE_DEVICES (and
+# GPU_DEVICE_ORDINAL) filter at the KFD/ROCr level FIRST; if either is also set,
+# HIP_VISIBLE_DEVICES then indexes into that already-shortened list and runs off
+# the end -> "no ROCm-capable device is detected" even though the card is right
+# there. So for the rocm backend, clear the ROCr-level masks and let
+# HIP_VISIBLE_DEVICES alone pick the card. (If apply_gpu_visibility in
+# lib/rdna4-env.sh sets ROCR too, this neutralizes it.)
+normalize_rocm_visibility() {
+    [[ "$BACKEND" == "rocm" ]] || return 0
+    unset ROCR_VISIBLE_DEVICES GPU_DEVICE_ORDINAL
+    [[ -n "$VISIBLE_DEVICES" ]] && export HIP_VISIBLE_DEVICES="$VISIBLE_DEVICES"
+}
+
 dry_run() {
     build_command
     apply_gpu_visibility "$BACKEND" "$VISIBLE_DEVICES"
+    normalize_rocm_visibility
     echo
     divider
     echo -e "  ${BOLD}Environment:${NC}"
     echo -e "    GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES}"
     echo -e "    RADV_DEBUG=${RADV_DEBUG}"
     [[ -n "${HIP_VISIBLE_DEVICES:-}" ]]     && echo -e "    HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES}"
+    [[ "$BACKEND" == "rocm" ]] && echo -e "    ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-<unset>}"
     [[ -n "${GGML_VK_VISIBLE_DEVICES:-}" ]] && echo -e "    GGML_VK_VISIBLE_DEVICES=${GGML_VK_VISIBLE_DEVICES}"
     [[ -n "$MMPROJ" && "$MMPROJ" != "none" ]] && echo -e "    ${CYAN}vision: enabled (${MMPROJ##*/}) -- encoder on $([[ "$MMPROJ_OFFLOAD" == off ]] && echo CPU || echo GPU)${NC}"
     [[ "$MTP" == "on" ]] && echo -e "    ${CYAN}MTP: draft-mtp, n-max=${SPEC_DRAFT_N_MAX} (KV forced f16)${NC}"
@@ -782,6 +812,7 @@ dry_run() {
 run_server() {
     build_command
     apply_gpu_visibility "$BACKEND" "$VISIBLE_DEVICES"
+    normalize_rocm_visibility
     echo
     divider
     echo -e "  ${GREEN}${BOLD}Starting llama-server (${BACKEND})...${NC}"
@@ -828,6 +859,7 @@ run_preset_headless() {
     if [[ "$action" == "dry" ]]; then
         build_command
         apply_gpu_visibility "$BACKEND" "$VISIBLE_DEVICES"
+        normalize_rocm_visibility
         printf '%q ' "${CMD[@]}"; echo
         exit 0
     fi
