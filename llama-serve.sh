@@ -52,6 +52,11 @@ FLASH_ATTN="on"          # Caveat: ROCm flash-attn is improving but still
                          # slower than CUDA's; try "off" if you see issues.
 JINJA="yes"
 REASONING_FORMAT=""
+TOOLS_TEMPLATE=""        # custom chat/tool template file (--chat-template-file).
+                         # Empty or "none" = use the model's own embedded template
+                         # (just --jinja). A path = serve that template. Per-model,
+                         # so each preset carries its own (e.g. a tool-calling
+                         # template for models the orchestrator delegates to).
 MMPROJ=""                # optional vision projector (*mmproj*.gguf)
 MMPROJ_OFFLOAD="on"      # on = vision encoder on GPU (llama.cpp default, fast).
                          # off = --no-mmproj-offload -> encoder on CPU. Slower
@@ -131,6 +136,7 @@ PARAM_LIST=(MODEL_PATH ALIAS MMPROJ MMPROJ_OFFLOAD MTP SPEC_DRAFT_N_MAX
             PRESENCE_PENALTY REPEAT_PENALTY THREADS BATCH_SIZE UBATCH_SIZE
             CACHE_TYPE_K CACHE_TYPE_V
             FLASH_ATTN JINJA REASONING_FORMAT EXTRA_ARGS SYSTEM_PROMPT
+            TOOLS_TEMPLATE
             SPLIT_MODE TENSOR_SPLIT MAIN_GPU VISIBLE_DEVICES)
 
 # Write every PARAM to a .conf (after syncing model path + alias).
@@ -216,7 +222,7 @@ apply_model_preset() {
     CACHE_TYPE_K="f16"; CACHE_TYPE_V="f16"
     FLASH_ATTN="on"; JINJA="yes"; MMPROJ=""; MMPROJ_OFFLOAD="on"; EXTRA_ARGS=""
     MTP="off"; SPEC_DRAFT_N_MAX="2"
-    SYSTEM_PROMPT=""; REASONING_FORMAT=""
+    SYSTEM_PROMPT=""; REASONING_FORMAT=""; TOOLS_TEMPLATE=""
     SPLIT_MODE="layer"; TENSOR_SPLIT=""; MAIN_GPU="0"; VISIBLE_DEVICES=""
 
     case "$model_file" in
@@ -596,6 +602,7 @@ configure_params() {
         echo -e "  ${BOLD}Features${NC}"
         echo -e "  ${GREEN}13)${NC} Jinja          ${BOLD}${JINJA}${NC}"
         echo -e "  ${GREEN}14)${NC} Reasoning fmt  ${BOLD}${REASONING_FORMAT:-auto}${NC}"
+        echo -e "  ${GREEN}23)${NC} Tools template ${BOLD}$([[ -n "$TOOLS_TEMPLATE" && "$TOOLS_TEMPLATE" != none ]] && basename "$TOOLS_TEMPLATE" || echo "model default")${NC} ${DIM}(--chat-template-file)${NC}"
         echo -e "  ${GREEN}15)${NC} System prompt  ${BOLD}${SYSTEM_PROMPT:-none}${NC}"
         echo -e "  ${GREEN}16)${NC} Vision mmproj  ${BOLD}${MMPROJ:-none}${NC} ${DIM}(--mmproj)${NC}"
         echo -e "  ${GREEN}20)${NC} mmproj offload ${BOLD}${MMPROJ_OFFLOAD}${NC} ${DIM}($([[ "$MMPROJ_OFFLOAD" == off ]] && echo "CPU, --no-mmproj-offload" || echo "GPU"))${NC}"
@@ -643,6 +650,7 @@ configure_params() {
             12) update_param REPEAT_PENALTY "Repeat penalty" ;;
             13) update_param JINJA "Jinja (yes/no)" ;;
             14) update_param REASONING_FORMAT "Reasoning format (auto/none/deepseek)" ;;
+            23) update_param TOOLS_TEMPLATE "Chat/tool template file (path, or 'none' for the model's own)" ;;
             15) read -rp "  System prompt: " SYSTEM_PROMPT ;;
             16) select_vision_model ;;
             20) [[ "$MMPROJ_OFFLOAD" == "on" ]] && MMPROJ_OFFLOAD="off" || MMPROJ_OFFLOAD="on"
@@ -746,6 +754,16 @@ build_command() {
     [[ "$THREADS" != "-1" ]] && CMD+=(-t "$THREADS")
     [[ "$JINJA" == "yes" ]]  && CMD+=(--jinja)
 
+    # Custom chat/tool template (per preset). Needs jinja; empty/"none" -> the
+    # model's own embedded template. Warn (don't die) if the path is missing.
+    if [[ "$JINJA" == "yes" && -n "$TOOLS_TEMPLATE" && "$TOOLS_TEMPLATE" != "none" ]]; then
+        if [[ -f "$TOOLS_TEMPLATE" ]]; then
+            CMD+=(--chat-template-file "$TOOLS_TEMPLATE")
+        else
+            echo -e "  ${YELLOW}warning: TOOLS_TEMPLATE not found ($TOOLS_TEMPLATE) -- using the model's embedded template${NC}" >&2
+        fi
+    fi
+
     [[ -n "$REASONING_FORMAT" && "$REASONING_FORMAT" != "auto" ]] && \
         CMD+=(--reasoning-format "$REASONING_FORMAT")
     if [[ -n "$MMPROJ" && "$MMPROJ" != "none" ]]; then
@@ -818,6 +836,7 @@ run_server() {
     echo -e "  ${GREEN}${BOLD}Starting llama-server (${BACKEND})...${NC}"
     echo -e "  ${DIM}Model:   $(basename "$SELECTED_MODEL")${NC}"
     [[ -n "$ALIAS" ]] && echo -e "  ${DIM}Alias:   ${ALIAS}${NC}"
+    [[ -n "$TOOLS_TEMPLATE" && "$TOOLS_TEMPLATE" != "none" ]] && echo -e "  ${DIM}Template: $(basename "$TOOLS_TEMPLATE")${NC}"
     [[ -n "$MMPROJ" && "$MMPROJ" != "none" ]] && echo -e "  ${DIM}Vision:  ${MMPROJ##*/} (encoder on $([[ "$MMPROJ_OFFLOAD" == off ]] && echo CPU || echo GPU))${NC}"
     [[ "$MTP" == "on" ]] && echo -e "  ${DIM}MTP:     draft-mtp, n-max=${SPEC_DRAFT_N_MAX}${NC}"
     echo -e "  ${DIM}API:     http://${HOST}:${PORT}/v1 (OpenAI-compatible)${NC}"

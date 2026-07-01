@@ -41,6 +41,50 @@ ensure_hf() {
     fi
 }
 
+# ── Collect local models into parallel arrays (shared by list + delete) ──
+#   MODEL_PATHS[i]  filesystem path (file or directory)
+#   MODEL_LABELS[i] display name
+#   MODEL_MSIZES[i] human-readable size
+# Handles loose *.gguf files, legacy one-level dirs with direct shards, and
+# org/name repo folders (two levels) holding .gguf anywhere beneath them.
+collect_models() {
+    MODEL_PATHS=(); MODEL_LABELS=(); MODEL_MSIZES=()
+    [[ -d "$MODEL_DIR" ]] || return 0
+    shopt -s nullglob
+
+    # 1. Standalone files in the root
+    for f in "$MODEL_DIR"/*.gguf; do
+        MODEL_PATHS+=("$f")
+        MODEL_LABELS+=("${f#"$MODEL_DIR"/}")
+        MODEL_MSIZES+=("$(du -h "$f" 2>/dev/null | cut -f1 || echo '???')")
+    done
+
+    # 2. Legacy one-level dirs that directly contain shards
+    for d in "$MODEL_DIR"/*/; do
+        local cd="${d%/}"
+        local shards=("$cd"/*.gguf)          # nullglob -> empty array if none
+        if [[ ${#shards[@]} -gt 0 ]]; then
+            MODEL_PATHS+=("$cd")
+            MODEL_LABELS+=("${cd#"$MODEL_DIR"/}/ (${#shards[@]} shards)")
+            MODEL_MSIZES+=("$(du -sh "$cd" 2>/dev/null | cut -f1 || echo '???')")
+        fi
+    done
+
+    # 3. org/name repo folders (two levels) holding .gguf anywhere beneath
+    for d in "$MODEL_DIR"/*/*/; do
+        local cd="${d%/}"
+        if find -L "$cd" -maxdepth 3 -name '*.gguf' -print -quit 2>/dev/null | grep -q .; then
+            local n; n=$(find -L "$cd" -maxdepth 3 -name '*.gguf' 2>/dev/null | wc -l | tr -d ' ')
+            local sfx=""; if [[ "$n" -ne 1 ]]; then sfx="s"; fi
+            MODEL_PATHS+=("$cd")
+            MODEL_LABELS+=("${cd#"$MODEL_DIR"/}/ (${n} file${sfx})")
+            MODEL_MSIZES+=("$(du -sh "$cd" 2>/dev/null | cut -f1 || echo '???')")
+        fi
+    done
+
+    shopt -u nullglob
+}
+
 # ── List local models ──
 list_local() {
     echo -e "  ${BOLD}Local models in ${MODEL_DIR}:${NC}"
@@ -51,67 +95,140 @@ list_local() {
         return
     fi
 
-    local count=0
-    shopt -s nullglob
-
-    # 1. Standalone files
-    for f in "$MODEL_DIR"/*.gguf; do
-        local size
-        size=$(du -h "$f" 2>/dev/null | cut -f1) || size="???"
-        local name="${f#$MODEL_DIR/}"
-        echo -e "  ${GREEN}•${NC} ${name} ${DIM}(${size})${NC}"
-        count=$((count + 1))
-    done
-
-    # 2. Directories (split models)
-    for d in "$MODEL_DIR"/*/; do
-        local clean_d="${d%/}"
-        if ls "$clean_d"/*.gguf &>/dev/null; then
-            local dir_size
-            dir_size=$(du -sh "$clean_d" 2>/dev/null | cut -f1) || dir_size="???"
-            local dir_name="${clean_d#$MODEL_DIR/}"
-            local gguf_count
-            gguf_count=$(ls -1 "$clean_d"/*.gguf | wc -l)
-            echo -e "  ${GREEN}•${NC} ${dir_name}/ ${DIM}(${dir_size}, ${gguf_count} shards)${NC}"
-            count=$((count + 1))
-        fi
-    done
-
-    shopt -u nullglob
-
-    if [[ $count -eq 0 ]]; then
+    collect_models
+    if [[ ${#MODEL_PATHS[@]} -eq 0 ]]; then
         echo -e "  ${DIM}No .gguf models found${NC}"
+    else
+        local i
+        for i in "${!MODEL_PATHS[@]}"; do
+            echo -e "  ${GREEN}•${NC} ${MODEL_LABELS[$i]} ${DIM}(${MODEL_MSIZES[$i]})${NC}"
+        done
     fi
     echo
 }
 
 # ── List files in a repo ──
+# ── Fetch a repo's file list (raw: gguf first, then everything else) ──
+# Prints one filename per line on stdout; errors go to stderr (exit 1).
+fetch_repo_files() {
+    local repo="$1"
+    python3 -c "
+from huggingface_hub import list_repo_files
+import sys
+try:
+    files = list_repo_files('$repo')
+except Exception as e:
+    sys.stderr.write(f'  Error: {e}\n'); sys.exit(1)
+gguf  = sorted(f for f in files if f.endswith('.gguf'))
+other = sorted(f for f in files if not f.endswith('.gguf'))
+for f in gguf + other:
+    print(f)
+"
+}
+
+# ── List files in a repo (viewer; shows ALL files, gguf highlighted) ──
 list_repo_files() {
     local repo="$1"
     echo -e "\n  ${BOLD}Files in ${repo}:${NC}"
     divider
-    python3 -c "
-from huggingface_hub import list_repo_files
-try:
-    files = list_repo_files('$repo')
-    gguf_files = [f for f in files if f.endswith('.gguf')]
-    other_files = [f for f in files if not f.endswith('.gguf')]
-
-    if gguf_files:
-        print('  GGUF files:')
-        for f in sorted(gguf_files):
-            print(f'    {f}')
-    else:
-        print('  No GGUF files found.')
-        print('  Other files:')
-        for f in sorted(other_files)[:20]:
-            print(f'    {f}')
-        if len(other_files) > 20:
-            print(f'    ... and {len(other_files) - 20} more')
-except Exception as e:
-    print(f'  Error: {e}')
-"
+    local files=()
+    mapfile -t files < <(fetch_repo_files "$repo")
+    if [[ ${#files[@]} -eq 0 ]]; then
+        echo -e "  ${DIM}No files found (or repo error)${NC}"
+        echo; return
+    fi
+    local f
+    for f in "${files[@]}"; do
+        if [[ "$f" == *.gguf ]]; then
+            echo -e "    ${GREEN}${f}${NC}"
+        else
+            echo -e "    ${DIM}${f}${NC}"
+        fi
+    done
     echo
+}
+
+# ── Pick one/several files from a repo (multi-select) and download them ──
+# Selection syntax: "1 5 6" or "1,5,6" or ranges "1-3", 'a'=all, Enter=whole
+# repo, 'c'=cancel. Everything lands in $MODEL_DIR/<repo>/.
+download_selected() {
+    local repo="$1"
+    echo -e "\n  ${DIM}Fetching file list...${NC}"
+
+    local files=()
+    mapfile -t files < <(fetch_repo_files "$repo")
+    if [[ ${#files[@]} -eq 0 ]]; then
+        echo -e "  ${RED}No files found (or repo error).${NC}"
+        return
+    fi
+
+    echo -e "\n  ${BOLD}Files in ${repo}:${NC}"
+    divider
+    local i
+    for i in "${!files[@]}"; do
+        local f="${files[$i]}" tag=""
+        [[ "$f" == *.gguf ]] && tag=" ${DIM}(gguf)${NC}"
+        printf "  ${GREEN}%2d)${NC} %s%b\n" "$((i+1))" "$f" "$tag"
+    done
+    echo
+    echo -e "  ${DIM}Pick: e.g. '1 5 6' or '1-3', 'a'=all, Enter=whole repo, 'c'=cancel${NC}"
+    read -rp "  > " sel
+
+    [[ "${sel,,}" == "c" ]] && return
+    if [[ -z "$sel" ]]; then
+        download_model "$repo" ""          # whole repo
+        return
+    fi
+
+    local chosen=()
+    if [[ "${sel,,}" == "a" ]]; then
+        chosen=("${files[@]}")
+    else
+        local tok
+        for tok in ${sel//,/ }; do          # commas -> spaces, then split
+            if [[ "$tok" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                local lo="${BASH_REMATCH[1]}" hi="${BASH_REMATCH[2]}" n
+                for ((n = lo; n <= hi; n++)); do
+                    [[ "$n" -ge 1 && "$n" -le ${#files[@]} ]] && chosen+=("${files[$((n-1))]}")
+                done
+            elif [[ "$tok" =~ ^[0-9]+$ ]]; then
+                if [[ "$tok" -ge 1 && "$tok" -le ${#files[@]} ]]; then
+                    chosen+=("${files[$((tok-1))]}")
+                else
+                    echo -e "  ${YELLOW}Out of range: $tok${NC}"
+                fi
+            else
+                echo -e "  ${YELLOW}Ignoring: $tok${NC}"
+            fi
+        done
+    fi
+
+    # de-duplicate while preserving order
+    local uniq=() c x dup
+    for c in "${chosen[@]}"; do
+        dup=0; for x in "${uniq[@]}"; do [[ "$x" == "$c" ]] && { dup=1; break; }; done
+        [[ $dup -eq 0 ]] && uniq+=("$c")
+    done
+    chosen=("${uniq[@]}")
+
+    if [[ ${#chosen[@]} -eq 0 ]]; then
+        echo -e "  ${RED}Nothing selected.${NC}"
+        return
+    fi
+
+    local dest="$MODEL_DIR/$repo"
+    echo -e "\n  ${BOLD}Downloading ${#chosen[@]} file(s)${NC} -> ${CYAN}${dest}/${NC}"
+    divider
+    local file ok=0 fail=0
+    for file in "${chosen[@]}"; do
+        echo -e "  ${CYAN}|${NC} $file"
+        if hf download "$repo" "$file" --local-dir "$dest"; then
+            ok=$((ok + 1))
+        else
+            echo -e "  ${RED}x failed: $file${NC}"; fail=$((fail + 1))
+        fi
+    done
+    echo -e "\n  ${GREEN}OK ${ok} downloaded${NC}$([[ $fail -gt 0 ]] && echo -e " / ${RED}${fail} failed${NC}")"
 }
 
 # ── Download a model ──
@@ -122,23 +239,27 @@ download_model() {
     echo -e "\n  ${BOLD}Downloading:${NC}"
     echo -e "  Repo: ${CYAN}${repo}${NC}"
 
+    # Always download into an org/name repo folder so files stay organised,
+    # whether it's the whole repo, a single file, or a shard pattern.
+    local dest="$MODEL_DIR/$repo"
+
     if [[ -n "$file" ]]; then
         if [[ "$file" == */ ]]; then
             echo -e "  Pattern: ${CYAN}${file}*${NC}"
-            echo -e "  Dest:    ${MODEL_DIR}/"
+            echo -e "  Dest:    ${dest}/"
             divider
-            hf download "$repo" --include "${file}*" --local-dir "$MODEL_DIR"
+            hf download "$repo" --include "${file}*" --local-dir "$dest"
         else
             echo -e "  File:    ${CYAN}${file}${NC}"
-            echo -e "  Dest:    ${MODEL_DIR}/"
+            echo -e "  Dest:    ${dest}/"
             divider
-            hf download "$repo" "$file" --local-dir "$MODEL_DIR"
+            hf download "$repo" "$file" --local-dir "$dest"
         fi
     else
         echo -e "  ${YELLOW}Downloading entire repo${NC}"
-        echo -e "  Dest:    ${MODEL_DIR}/${repo}"
+        echo -e "  Dest:    ${dest}/"
         divider
-        hf download "$repo" --local-dir "$MODEL_DIR/$repo"
+        hf download "$repo" --local-dir "$dest"
     fi
 
     if [[ $? -eq 0 ]]; then
@@ -153,56 +274,38 @@ delete_model() {
     echo -e "  ${BOLD}Delete a local model${NC}"
     divider
 
-    local TARGETS=()
-    local display_names=()
-    local display_sizes=()
+    collect_models
 
-    shopt -s nullglob
-
-    for f in "$MODEL_DIR"/*.gguf; do
-        TARGETS+=("$f")
-        local size
-        size=$(du -h "$f" 2>/dev/null | cut -f1) || size="???"
-        display_sizes+=("$size")
-        display_names+=("${f#$MODEL_DIR/}")
-    done
-
-    for d in "$MODEL_DIR"/*/; do
-        local clean_d="${d%/}"
-        if ls "$clean_d"/*.gguf &>/dev/null; then
-            TARGETS+=("$clean_d")
-            local dir_size
-            dir_size=$(du -sh "$clean_d" 2>/dev/null | cut -f1) || dir_size="???"
-            display_sizes+=("$dir_size")
-            local dir_name="${clean_d#$MODEL_DIR/}"
-            display_names+=("${dir_name}/ (split model)")
-        fi
-    done
-
-    shopt -u nullglob
-
-    if [[ ${#TARGETS[@]} -eq 0 ]]; then
+    if [[ ${#MODEL_PATHS[@]} -eq 0 ]]; then
         echo -e "  ${DIM}No models found${NC}\n"
         return
     fi
 
-    for i in "${!TARGETS[@]}"; do
-        echo -e "  ${GREEN}$((i+1)))${NC} ${display_names[$i]} ${DIM}(${display_sizes[$i]})${NC}"
+    local i
+    for i in "${!MODEL_PATHS[@]}"; do
+        echo -e "  ${GREEN}$((i+1)))${NC} ${MODEL_LABELS[$i]} ${DIM}(${MODEL_MSIZES[$i]})${NC}"
     done
 
     echo
-    read -rp "  Select model [1-${#TARGETS[@]}] (or 'c' to cancel): " choice
+    read -rp "  Select model [1-${#MODEL_PATHS[@]}] (or 'c' to cancel): " choice
 
     if [[ "${choice,,}" == "c" || -z "$choice" ]]; then
         return
     fi
 
-    if [[ "$choice" -ge 1 && "$choice" -le ${#TARGETS[@]} ]]; then
-        local target="${TARGETS[$((choice-1))]}"
-        read -rp "  Delete ${display_names[$((choice-1))]}? [y/N]: " confirm
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 && "$choice" -le ${#MODEL_PATHS[@]} ]]; then
+        local target="${MODEL_PATHS[$((choice-1))]}"
+        read -rp "  Delete ${MODEL_LABELS[$((choice-1))]}? [y/N]: " confirm
         if [[ "${confirm,,}" == "y" ]]; then
             rm -rf "$target"
-            echo -e "  ${GREEN}✓ Deleted${NC}\n"
+            echo -e "  ${GREEN}✓ Deleted${NC}"
+            # If that emptied the org/ parent (org/name layout), prune it too.
+            local parent; parent="$(dirname "$target")"
+            if [[ "$parent" != "$MODEL_DIR" && -d "$parent" && -z "$(ls -A "$parent" 2>/dev/null)" ]]; then
+                rmdir "$parent" 2>/dev/null && \
+                    echo -e "  ${DIM}removed empty ${parent#"$MODEL_DIR"/}/${NC}"
+            fi
+            echo
         fi
     fi
 }
@@ -263,7 +366,7 @@ main() {
         echo -e "  ${BOLD}Main Menu${NC}"
         divider
         echo -e "  ${GREEN} 1)${NC} Quick download (popular models)"
-        echo -e "  ${GREEN} 2)${NC} Download by repo + filename"
+        echo -e "  ${GREEN} 2)${NC} Download from a repo (pick files)"
         echo -e "  ${GREEN} 3)${NC} Download split model (multi-shard)"
         echo -e "  ${GREEN} 4)${NC} List files in a HF repo"
         echo -e "  ${GREEN} 5)${NC} List local models"
@@ -277,21 +380,14 @@ main() {
             1) quick_download ;;
             2)
                 header
-                echo -e "  ${BOLD}Download Model${NC}"
+                echo -e "  ${BOLD}Download Model${NC} ${DIM}(pick one, several, or all files)${NC}"
                 divider
-                echo -e "  ${DIM}Example repo:  unsloth/Qwen3.5-27B-GGUF${NC}"
-                echo -e "  ${DIM}Example file:  Qwen3.5-27B-Q4_K_M.gguf${NC}\n"
+                echo -e "  ${DIM}Example repo:  unsloth/Qwen3.5-27B-GGUF${NC}\n"
 
                 read -rp "  HF repo (org/name) ['c' to cancel]: " repo
                 if [[ "${repo,,}" == "c" || -z "$repo" ]]; then continue; fi
 
-                echo -e "\n  ${DIM}Fetching file list...${NC}"
-                list_repo_files "$repo"
-
-                read -rp "  Filename (Enter for entire repo, 'c' to cancel): " file
-                if [[ "${file,,}" == "c" ]]; then continue; fi
-
-                download_model "$repo" "$file"
+                download_selected "$repo"
                 read -rp "  Press Enter to continue..."
                 ;;
             3)
@@ -312,7 +408,8 @@ main() {
 
                 [[ "$prefix" != */ ]] && prefix="${prefix}/"
                 echo -e "\n  Downloading all files matching: ${CYAN}${prefix}*${NC}"
-                hf download "$repo" --include "${prefix}*" --local-dir "$MODEL_DIR"
+                echo -e "  Dest: ${CYAN}${MODEL_DIR}/${repo}/${NC}"
+                hf download "$repo" --include "${prefix}*" --local-dir "$MODEL_DIR/$repo"
                 echo -e "\n  ${GREEN}✓ Download complete!${NC}"
 
                 read -rp "  Press Enter to continue..."
