@@ -1,16 +1,19 @@
 #!/bin/bash
 # ============================================================================
-#  build_tools.sh -- Build llama.cpp and stable-diffusion.cpp
+#  build_tools.sh -- Build llama.cpp, stable-diffusion.cpp, whisper.cpp, piper
 #  Hardware: 2x AMD Radeon AI PRO R9700 (gfx1201, RDNA4) / 7950X (znver4)
 #
 #  Usage:
-#    ./build_tools.sh                    # build everything (llama + sd, both backends)
-#    ./build_tools.sh rocm               # llama+sd, ROCm only
-#    ./build_tools.sh vulkan             # llama+sd, Vulkan only
+#    ./build_tools.sh                    # build everything (all projects, both backends)
+#    ./build_tools.sh rocm               # all projects, ROCm only
+#    ./build_tools.sh vulkan             # all projects, Vulkan only
 #    ./build_tools.sh llama              # llama.cpp, both backends
 #    ./build_tools.sh sd                 # stable-diffusion.cpp, both backends
+#    ./build_tools.sh whisper            # whisper.cpp, both backends
+#    ./build_tools.sh piper              # piper TTS (venv install, no GPU backend)
 #    ./build_tools.sh llama rocm         # just llama.cpp ROCm
 #    ./build_tools.sh sd vulkan          # just stable-diffusion.cpp Vulkan
+#    ./build_tools.sh whisper rocm       # just whisper.cpp ROCm
 #    ./build_tools.sh --clean            # nuke build dirs first
 # ============================================================================
 
@@ -21,6 +24,15 @@ ROCM_DIR="/srv/llama/llama.cpp-rocm"
 VULKAN_DIR="/srv/llama/llama.cpp-vulkan"
 SD_ROCM_DIR="/srv/llama/stable-diffusion.cpp-rocm"
 SD_VULKAN_DIR="/srv/llama/stable-diffusion.cpp-vulkan"
+WHISPER_ROCM_DIR="/srv/llama/whisper.cpp-rocm"
+WHISPER_VULKAN_DIR="/srv/llama/whisper.cpp-vulkan"
+# Piper TTS (piper1-gpl) is a Python package -- no GPU backend, no CMake.
+# Installed into a dedicated venv; voices (onnx + onnx.json) live with the
+# other models so the orchestrator's voice.tts.command can reference them.
+PIPER_VENV="/srv/llama/piper/.venv"
+PIPER_VOICE_DIR="/srv/models/piper"
+PIPER_VOICE="en_US-lessac-high"
+PIPER_VOICE_BASE="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/high"
 # Shared install location for the SD web UI frontend. The Vite project lives
 # inside each SD source tree at examples/server/frontend, but the built
 # artifacts are copied here so both backends use the same canonical path
@@ -30,30 +42,35 @@ SD_FRONTEND_HTML="${SD_FRONTEND_INSTALL_DIR}/dist/index.html"
 JOBS="${JOBS:-32}"
 
 # -- Args -------------------------------------------------------------------
-# Parse projects (llama, sd) and backends (rocm, vulkan) independently.
-# If only backends specified, both projects are built. If only projects
-# specified, both backends are built. If neither, both x both.
+# Parse projects (llama, sd, whisper, piper) and backends (rocm, vulkan)
+# independently. If only backends specified, all projects are built. If only
+# projects specified, both backends are built. If neither, all x both.
+# piper is backend-less: it always produces a single "piper" job.
 PROJECTS=()
 BACKENDS=()
 CLEAN=0
 for arg in "$@"; do
     case "$arg" in
-        llama|sd)    PROJECTS+=("$arg") ;;
+        llama|sd|whisper|piper) PROJECTS+=("$arg") ;;
         rocm|vulkan) BACKENDS+=("$arg") ;;
         --clean|-c)  CLEAN=1 ;;
         -h|--help)
-            sed -n '3,16p' "$0"
+            sed -n '3,18p' "$0"
             exit 0
             ;;
         *) echo "Unknown arg: $arg"; exit 1 ;;
     esac
 done
-[[ ${#PROJECTS[@]} -eq 0 ]] && PROJECTS=(llama sd)
+[[ ${#PROJECTS[@]} -eq 0 ]] && PROJECTS=(llama sd whisper piper)
 [[ ${#BACKENDS[@]} -eq 0 ]] && BACKENDS=(rocm vulkan)
 
 # Build a flat list of (project, backend) jobs to run
 JOBS_LIST=()
 for p in "${PROJECTS[@]}"; do
+    if [[ "$p" == "piper" ]]; then
+        JOBS_LIST+=("piper")
+        continue
+    fi
     for b in "${BACKENDS[@]}"; do
         JOBS_LIST+=("${p}-${b}")
     done
@@ -252,6 +269,105 @@ build_llama_vulkan() {
     fi
 }
 
+# -- whisper.cpp ROCm build ---------------------------------------------------
+build_whisper_rocm() {
+    check_clone "$WHISPER_ROCM_DIR" "https://github.com/ggml-org/whisper.cpp"
+    sync_repo "$WHISPER_ROCM_DIR"
+    cd "$WHISPER_ROCM_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean whisper ROCm build dir"
+        rm -rf build
+    fi
+
+    step "Configure whisper.cpp ROCm (gfx1201 = R9700)"
+    # No ffmpeg: the orchestrator web UI sends 16 kHz mono WAV, which
+    # whisper-server decodes natively. Add -DWHISPER_FFMPEG=ON if you ever
+    # need to feed it arbitrary audio formats.
+    cmake -B build \
+        -DGGML_HIP=ON \
+        -DAMDGPU_TARGETS=gfx1201 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
+        -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
+        -DCMAKE_C_FLAGS="-march=znver4 -O3" \
+        -DCMAKE_CXX_FLAGS="-march=znver4 -O3"
+
+    step "Build whisper ROCm (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" --target whisper-server whisper-cli
+
+    if [[ -x "$WHISPER_ROCM_DIR/build/bin/whisper-server" ]]; then
+        ok "whisper ROCm build at $WHISPER_ROCM_DIR/build/bin/whisper-server"
+    else
+        fail "whisper ROCm build produced no whisper-server binary"
+    fi
+}
+
+# -- whisper.cpp Vulkan build -------------------------------------------------
+build_whisper_vulkan() {
+    check_clone "$WHISPER_VULKAN_DIR" "https://github.com/ggml-org/whisper.cpp"
+    sync_repo "$WHISPER_VULKAN_DIR"
+    cd "$WHISPER_VULKAN_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean whisper Vulkan build dir"
+        rm -rf build
+    fi
+
+    step "Configure whisper.cpp Vulkan"
+    cmake -B build \
+        -DGGML_VULKAN=ON \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_FLAGS="-march=znver4 -O3" \
+        -DCMAKE_CXX_FLAGS="-march=znver4 -O3"
+
+    step "Build whisper Vulkan (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" --target whisper-server whisper-cli
+
+    if [[ -x "$WHISPER_VULKAN_DIR/build/bin/whisper-server" ]]; then
+        ok "whisper Vulkan build at $WHISPER_VULKAN_DIR/build/bin/whisper-server"
+    else
+        fail "whisper Vulkan build produced no whisper-server binary"
+    fi
+}
+
+# -- piper TTS install (venv, CPU only) ---------------------------------------
+build_piper() {
+    step "Install piper TTS -> ${PIPER_VENV}"
+
+    command -v python3 >/dev/null 2>&1 || fail "python3 not found"
+    command -v curl    >/dev/null 2>&1 || fail "curl not found (needed for voice download)"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean piper venv"
+        rm -rf "$PIPER_VENV"
+    fi
+
+    if [[ ! -x "$PIPER_VENV/bin/pip" ]]; then
+        python3 -m venv "$PIPER_VENV"
+    fi
+    "$PIPER_VENV/bin/pip" install --quiet --upgrade pip
+    "$PIPER_VENV/bin/pip" install --quiet --upgrade piper-tts
+
+    # Default voice model (onnx + config); skip if already present
+    mkdir -p "$PIPER_VOICE_DIR"
+    local onnx="${PIPER_VOICE_DIR}/${PIPER_VOICE}.onnx"
+    local json="${PIPER_VOICE_DIR}/${PIPER_VOICE}.onnx.json"
+    if [[ ! -f "$onnx" ]]; then
+        step "Download voice ${PIPER_VOICE}"
+        curl -fL --progress-bar -o "$onnx" "${PIPER_VOICE_BASE}/${PIPER_VOICE}.onnx"
+        curl -fL --progress-bar -o "$json" "${PIPER_VOICE_BASE}/${PIPER_VOICE}.onnx.json"
+    else
+        ok "Voice ${PIPER_VOICE} already present"
+    fi
+
+    if [[ -x "$PIPER_VENV/bin/piper" ]]; then
+        ok "piper at $PIPER_VENV/bin/piper (voice: $onnx)"
+    else
+        fail "piper install produced no piper binary in $PIPER_VENV/bin"
+    fi
+}
+
 # -- stable-diffusion.cpp ROCm build ----------------------------------------
 build_sd_rocm() {
     check_clone "$SD_ROCM_DIR" "https://github.com/leejet/stable-diffusion.cpp" recursive
@@ -340,6 +456,15 @@ preflight() {
             || fail "ninja not found (required for SD ROCm build) -- pacman -S ninja"
     fi
 
+    # piper needs python3 (venv) and curl (voice download)
+    if [[ " ${JOBS_LIST[*]} " == *" piper "* ]]; then
+        command -v python3 >/dev/null 2>&1 || fail "python3 not found (required for piper)"
+        python3 -m venv --help >/dev/null 2>&1 \
+            || fail "python3 venv module missing -- pacman -S python"
+        command -v curl >/dev/null 2>&1 \
+            || fail "curl not found (required for piper voice download)"
+    fi
+
     # pnpm/npm required for SD web UI -- warn once if any SD backend is built
     if [[ " ${JOBS_LIST[*]} " == *" sd-"* ]]; then
         if command -v pnpm >/dev/null 2>&1; then
@@ -415,7 +540,7 @@ preflight() {
 
 # -- Main -------------------------------------------------------------------
 main() {
-    echo -e "${BOLD}llama.cpp + stable-diffusion.cpp build${NC}"
+    echo -e "${BOLD}llama.cpp + stable-diffusion.cpp + whisper.cpp build${NC}"
     echo -e "${DIM}Projects: ${PROJECTS[*]} | Backends: ${BACKENDS[*]} | Clean: ${CLEAN} | Jobs: ${JOBS}${NC}"
     echo -e "${DIM}Plan:     ${JOBS_LIST[*]}${NC}"
 
@@ -426,10 +551,13 @@ main() {
 
     for job in "${JOBS_LIST[@]}"; do
         case "$job" in
-            llama-rocm)   build_llama_rocm ;;
-            llama-vulkan) build_llama_vulkan ;;
-            sd-rocm)      build_sd_rocm ;;
-            sd-vulkan)    build_sd_vulkan ;;
+            llama-rocm)     build_llama_rocm ;;
+            llama-vulkan)   build_llama_vulkan ;;
+            sd-rocm)        build_sd_rocm ;;
+            sd-vulkan)      build_sd_vulkan ;;
+            whisper-rocm)   build_whisper_rocm ;;
+            whisper-vulkan) build_whisper_vulkan ;;
+            piper)          build_piper ;;
         esac
     done
 
@@ -439,10 +567,13 @@ main() {
     echo
     for job in "${JOBS_LIST[@]}"; do
         case "$job" in
-            llama-rocm)   echo -e "  llama  ROCm:   ${ROCM_DIR}/build/bin/llama-server" ;;
-            llama-vulkan) echo -e "  llama  Vulkan: ${VULKAN_DIR}/build/bin/llama-server" ;;
-            sd-rocm)      echo -e "  sd     ROCm:   ${SD_ROCM_DIR}/build/bin/{sd-cli,sd-server}" ;;
-            sd-vulkan)    echo -e "  sd     Vulkan: ${SD_VULKAN_DIR}/build/bin/{sd-cli,sd-server}" ;;
+            llama-rocm)     echo -e "  llama   ROCm:   ${ROCM_DIR}/build/bin/llama-server" ;;
+            llama-vulkan)   echo -e "  llama   Vulkan: ${VULKAN_DIR}/build/bin/llama-server" ;;
+            sd-rocm)        echo -e "  sd      ROCm:   ${SD_ROCM_DIR}/build/bin/{sd-cli,sd-server}" ;;
+            sd-vulkan)      echo -e "  sd      Vulkan: ${SD_VULKAN_DIR}/build/bin/{sd-cli,sd-server}" ;;
+            whisper-rocm)   echo -e "  whisper ROCm:   ${WHISPER_ROCM_DIR}/build/bin/whisper-server" ;;
+            whisper-vulkan) echo -e "  whisper Vulkan: ${WHISPER_VULKAN_DIR}/build/bin/whisper-server" ;;
+            piper)          echo -e "  piper   TTS:    ${PIPER_VENV}/bin/piper (voice: ${PIPER_VOICE_DIR}/${PIPER_VOICE}.onnx)" ;;
         esac
     done
     if [[ -f "$SD_FRONTEND_HTML" ]]; then
@@ -459,6 +590,10 @@ main() {
         echo -e "  ${ROCM_DIR}/build/bin/llama-server --list-devices"
     [[ " ${JOBS_LIST[*]} " == *" sd-rocm "* ]] && \
         echo -e "  ${SD_ROCM_DIR}/build/bin/sd-cli --help | head -30"
+    [[ " ${JOBS_LIST[*]} " == *" whisper-rocm "* ]] && \
+        echo -e "  ${WHISPER_ROCM_DIR}/build/bin/whisper-server -m /srv/models/whisper/ggml-small.bin --port 8097"
+    [[ " ${JOBS_LIST[*]} " == *" piper "* ]] && \
+        echo -e "  echo 'hello world' | ${PIPER_VENV}/bin/piper --model ${PIPER_VOICE_DIR}/${PIPER_VOICE}.onnx --output_file /tmp/piper-test.wav"
 }
 
 main
