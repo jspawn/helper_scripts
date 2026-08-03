@@ -3,20 +3,24 @@
 #  build_tools.sh -- Build llama.cpp, stable-diffusion.cpp, whisper.cpp,
 #                     piper TTS, and the llm-tools venv
 #  Hardware: 2x AMD Radeon AI PRO R9700 (gfx1201, RDNA4) / 7950X (znver4)
+#            CUDA (NVIDIA) and SYCL (Intel oneAPI) backends also supported
 #
 #  Usage:
-#    ./build_tools.sh                    # build everything (all projects, both backends)
-#    ./build_tools.sh rocm               # all projects, ROCm only
-#    ./build_tools.sh vulkan             # all projects, Vulkan only
-#    ./build_tools.sh llama              # llama.cpp, both backends
-#    ./build_tools.sh sd                 # stable-diffusion.cpp, both backends
-#    ./build_tools.sh whisper            # whisper.cpp, both backends
-#    ./build_tools.sh piper              # piper TTS (venv install, no GPU backend)
-#    ./build_tools.sh tools              # llm-tools venv (hf download tooling)
+#    ./build_tools.sh                    # show this help (builds nothing)
+#    ./build_tools.sh all                # all projects, default backends (rocm+vulkan)
 #    ./build_tools.sh llama rocm         # just llama.cpp ROCm
 #    ./build_tools.sh sd vulkan          # just stable-diffusion.cpp Vulkan
-#    ./build_tools.sh whisper rocm       # just whisper.cpp ROCm
-#    ./build_tools.sh --clean            # nuke build dirs first
+#    ./build_tools.sh whisper cuda       # just whisper.cpp CUDA (NVIDIA)
+#    ./build_tools.sh llama sycl         # just llama.cpp SYCL (Intel oneAPI)
+#    ./build_tools.sh rocm               # all projects, ROCm only
+#    ./build_tools.sh piper              # piper TTS (venv install, no GPU backend)
+#    ./build_tools.sh tools              # llm-tools venv (hf download tooling)
+#    ./build_tools.sh --clean llama cuda # nuke build dir first, then build
+#
+#  Projects:  llama, sd, whisper, piper, tools, all
+#  Backends:  rocm, vulkan, cuda, sycl  (default if omitted: rocm vulkan)
+#  Env vars:  JOBS=16        parallelism (default 32)
+#             CUDA_ARCHS=89   CUDA arch list (default "native" = auto-detect)
 # ============================================================================
 
 set -euo pipefail
@@ -24,10 +28,19 @@ set -euo pipefail
 # -- Paths ------------------------------------------------------------------
 ROCM_DIR="/srv/llama/llama.cpp-rocm"
 VULKAN_DIR="/srv/llama/llama.cpp-vulkan"
+CUDA_DIR="/srv/llama/llama.cpp-cuda"
+SYCL_DIR="/srv/llama/llama.cpp-sycl"
 SD_ROCM_DIR="/srv/llama/stable-diffusion.cpp-rocm"
 SD_VULKAN_DIR="/srv/llama/stable-diffusion.cpp-vulkan"
+SD_CUDA_DIR="/srv/llama/stable-diffusion.cpp-cuda"
+SD_SYCL_DIR="/srv/llama/stable-diffusion.cpp-sycl"
 WHISPER_ROCM_DIR="/srv/llama/whisper.cpp-rocm"
 WHISPER_VULKAN_DIR="/srv/llama/whisper.cpp-vulkan"
+WHISPER_CUDA_DIR="/srv/llama/whisper.cpp-cuda"
+WHISPER_SYCL_DIR="/srv/llama/whisper.cpp-sycl"
+# CUDA target architectures for llama/sd/whisper CUDA builds. "native" lets
+# nvcc detect the installed GPU(s); set e.g. CUDA_ARCHS=89 for a fixed list.
+CUDA_ARCHS="${CUDA_ARCHS:-native}"
 # Piper TTS (piper1-gpl) is a Python package -- no GPU backend, no CMake.
 # Installed into a dedicated venv; voices (onnx + onnx.json) live with the
 # other models so the orchestrator's voice.tts.command can reference them.
@@ -49,23 +62,32 @@ SD_FRONTEND_HTML="${SD_FRONTEND_INSTALL_DIR}/dist/index.html"
 JOBS="${JOBS:-32}"
 
 # -- Args -------------------------------------------------------------------
-# Parse projects (llama, sd, whisper, piper, tools) and backends (rocm, vulkan)
-# independently. If only backends specified, all projects are built. If only
-# projects specified, both backends are built. If neither, all x both.
+# Parse projects (llama, sd, whisper, piper, tools, all) and backends
+# (rocm, vulkan, cuda, sycl) independently. If only backends specified, all
+# projects are built. If only projects specified, the default backends
+# (rocm+vulkan) are built. No args at all shows the usage header and exits.
 # piper and tools are backend-less: each produces a single job.
+usage() { sed -n '/^#  Usage:/,/====/p' "$0"; }
+
+if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+fi
+
 PROJECTS=()
 BACKENDS=()
 CLEAN=0
 for arg in "$@"; do
     case "$arg" in
         llama|sd|whisper|piper|tools) PROJECTS+=("$arg") ;;
-        rocm|vulkan) BACKENDS+=("$arg") ;;
+        all) PROJECTS+=(llama sd whisper piper tools) ;;
+        rocm|vulkan|cuda|sycl) BACKENDS+=("$arg") ;;
         --clean|-c)  CLEAN=1 ;;
         -h|--help)
-            sed -n '3,18p' "$0"
+            usage
             exit 0
             ;;
-        *) echo "Unknown arg: $arg"; exit 1 ;;
+        *) echo "Unknown arg: $arg (try --help)"; exit 1 ;;
     esac
 done
 [[ ${#PROJECTS[@]} -eq 0 ]] && PROJECTS=(llama sd whisper piper tools)
@@ -276,6 +298,89 @@ build_llama_vulkan() {
     fi
 }
 
+# -- Intel oneAPI environment (for SYCL builds) -------------------------------
+# SYCL builds need icx/icpx plus the oneAPI libs. Source the standard
+# setvars.sh if the compiler isn't already on PATH.
+ensure_oneapi() {
+    if ! command -v icpx >/dev/null 2>&1; then
+        if [[ -f /opt/intel/oneapi/setvars.sh ]]; then
+            step "Source Intel oneAPI environment"
+            # setvars.sh trips on unbound vars under `set -u`
+            set +u
+            source /opt/intel/oneapi/setvars.sh >/dev/null
+            set -u
+        else
+            fail "icpx not found -- install Intel oneAPI (AUR: intel-oneapi-compiler-dpcpp-cpp)"
+        fi
+    fi
+}
+
+# -- llama.cpp CUDA build (NVIDIA) --------------------------------------------
+build_llama_cuda() {
+    check_clone "$CUDA_DIR" "https://github.com/ggml-org/llama.cpp"
+    sync_repo "$CUDA_DIR"
+    cd "$CUDA_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean CUDA build dir"
+        rm -rf build
+    fi
+
+    step "Configure CUDA (archs: ${CUDA_ARCHS})"
+    # Web UI disabled here too -- see note in build_llama_rocm().
+    cmake -B build \
+        -DGGML_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
+        -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_BUILD_WEBUI=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_FLAGS="-march=znver4 -O3" \
+        -DCMAKE_CXX_FLAGS="-march=znver4 -O3"
+
+    step "Build CUDA (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" --target llama-server llama-cli llama-bench
+
+    if [[ -x "$CUDA_DIR/build/bin/llama-server" ]]; then
+        ok "CUDA build at $CUDA_DIR/build/bin/llama-server"
+    else
+        fail "CUDA build produced no llama-server binary"
+    fi
+}
+
+# -- llama.cpp SYCL build (Intel oneAPI) ----------------------------------------
+build_llama_sycl() {
+    check_clone "$SYCL_DIR" "https://github.com/ggml-org/llama.cpp"
+    sync_repo "$SYCL_DIR"
+    ensure_oneapi
+    cd "$SYCL_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean SYCL build dir"
+        rm -rf build
+    fi
+
+    step "Configure SYCL (Intel oneAPI)"
+    # Web UI disabled here too -- see note in build_llama_rocm().
+    # No -march flags here: keep the oneAPI defaults; add -fsycl-targets via
+    # CMAKE_CXX_FLAGS if you need to target something other than the default.
+    cmake -B build \
+        -DGGML_SYCL=ON \
+        -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_BUILD_WEBUI=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=icx \
+        -DCMAKE_CXX_COMPILER=icpx
+
+    step "Build SYCL (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" --target llama-server llama-cli llama-bench
+
+    if [[ -x "$SYCL_DIR/build/bin/llama-server" ]]; then
+        ok "SYCL build at $SYCL_DIR/build/bin/llama-server"
+    else
+        fail "SYCL build produced no llama-server binary"
+    fi
+}
+
 # -- whisper.cpp ROCm build ---------------------------------------------------
 build_whisper_rocm() {
     check_clone "$WHISPER_ROCM_DIR" "https://github.com/ggml-org/whisper.cpp"
@@ -335,6 +440,66 @@ build_whisper_vulkan() {
         ok "whisper Vulkan build at $WHISPER_VULKAN_DIR/build/bin/whisper-server"
     else
         fail "whisper Vulkan build produced no whisper-server binary"
+    fi
+}
+
+# -- whisper.cpp CUDA build (NVIDIA) --------------------------------------------
+build_whisper_cuda() {
+    check_clone "$WHISPER_CUDA_DIR" "https://github.com/ggml-org/whisper.cpp"
+    sync_repo "$WHISPER_CUDA_DIR"
+    cd "$WHISPER_CUDA_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean whisper CUDA build dir"
+        rm -rf build
+    fi
+
+    step "Configure whisper.cpp CUDA (archs: ${CUDA_ARCHS})"
+    # No ffmpeg -- see note in build_whisper_rocm().
+    cmake -B build \
+        -DGGML_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_FLAGS="-march=znver4 -O3" \
+        -DCMAKE_CXX_FLAGS="-march=znver4 -O3"
+
+    step "Build whisper CUDA (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" --target whisper-server whisper-cli
+
+    if [[ -x "$WHISPER_CUDA_DIR/build/bin/whisper-server" ]]; then
+        ok "whisper CUDA build at $WHISPER_CUDA_DIR/build/bin/whisper-server"
+    else
+        fail "whisper CUDA build produced no whisper-server binary"
+    fi
+}
+
+# -- whisper.cpp SYCL build (Intel oneAPI) ---------------------------------------
+build_whisper_sycl() {
+    check_clone "$WHISPER_SYCL_DIR" "https://github.com/ggml-org/whisper.cpp"
+    sync_repo "$WHISPER_SYCL_DIR"
+    ensure_oneapi
+    cd "$WHISPER_SYCL_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean whisper SYCL build dir"
+        rm -rf build
+    fi
+
+    step "Configure whisper.cpp SYCL (Intel oneAPI)"
+    # No ffmpeg -- see note in build_whisper_rocm().
+    cmake -B build \
+        -DGGML_SYCL=ON \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=icx \
+        -DCMAKE_CXX_COMPILER=icpx
+
+    step "Build whisper SYCL (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" --target whisper-server whisper-cli
+
+    if [[ -x "$WHISPER_SYCL_DIR/build/bin/whisper-server" ]]; then
+        ok "whisper SYCL build at $WHISPER_SYCL_DIR/build/bin/whisper-server"
+    else
+        fail "whisper SYCL build produced no whisper-server binary"
     fi
 }
 
@@ -475,6 +640,70 @@ build_sd_vulkan() {
     build_sd_frontend "$SD_VULKAN_DIR"
 }
 
+# -- stable-diffusion.cpp CUDA build (NVIDIA) -----------------------------------
+build_sd_cuda() {
+    check_clone "$SD_CUDA_DIR" "https://github.com/leejet/stable-diffusion.cpp" recursive
+    sync_repo "$SD_CUDA_DIR" recursive
+    cd "$SD_CUDA_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean SD CUDA build dir"
+        rm -rf build
+    fi
+
+    step "Configure stable-diffusion.cpp CUDA (archs: ${CUDA_ARCHS})"
+    cmake -B build \
+        -DSD_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_FLAGS="-march=znver4 -O3" \
+        -DCMAKE_CXX_FLAGS="-march=znver4 -O3"
+
+    step "Build SD CUDA (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS"
+
+    if [[ -x "$SD_CUDA_DIR/build/bin/sd" ]] \
+       || [[ -x "$SD_CUDA_DIR/build/bin/sd-cli" ]]; then
+        ok "SD CUDA build at $SD_CUDA_DIR/build/bin/"
+    else
+        fail "SD CUDA build produced no sd/sd-cli binary"
+    fi
+
+    build_sd_frontend "$SD_CUDA_DIR"
+}
+
+# -- stable-diffusion.cpp SYCL build (Intel oneAPI) ------------------------------
+build_sd_sycl() {
+    check_clone "$SD_SYCL_DIR" "https://github.com/leejet/stable-diffusion.cpp" recursive
+    sync_repo "$SD_SYCL_DIR" recursive
+    ensure_oneapi
+    cd "$SD_SYCL_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean SD SYCL build dir"
+        rm -rf build
+    fi
+
+    step "Configure stable-diffusion.cpp SYCL (Intel oneAPI)"
+    cmake -B build \
+        -DSD_SYCL=ON \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=icx \
+        -DCMAKE_CXX_COMPILER=icpx
+
+    step "Build SD SYCL (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS"
+
+    if [[ -x "$SD_SYCL_DIR/build/bin/sd" ]] \
+       || [[ -x "$SD_SYCL_DIR/build/bin/sd-cli" ]]; then
+        ok "SD SYCL build at $SD_SYCL_DIR/build/bin/"
+    else
+        fail "SD SYCL build produced no sd/sd-cli binary"
+    fi
+
+    build_sd_frontend "$SD_SYCL_DIR"
+}
+
 # -- Sanity: toolchain ------------------------------------------------------
 preflight() {
     step "Pre-flight checks"
@@ -513,7 +742,7 @@ preflight() {
     fi
 
     # Dedupe backends across projects so we don't print the same warning twice
-    local checked_rocm=0 checked_vulkan=0
+    local checked_rocm=0 checked_vulkan=0 checked_cuda=0 checked_sycl=0
     for job in "${JOBS_LIST[@]}"; do
         local backend="${job#*-}"
 
@@ -569,6 +798,30 @@ preflight() {
                 warn "vulkaninfo not found -- pacman -S vulkan-tools (optional)"
             fi
         fi
+
+        if [[ "$backend" == "cuda" && $checked_cuda -eq 0 ]]; then
+            checked_cuda=1
+            command -v nvcc >/dev/null 2>&1 \
+                || fail "nvcc not found -- install the CUDA toolkit (pacman -S cuda)"
+            if command -v nvidia-smi >/dev/null 2>&1; then
+                local n
+                n=$(nvidia-smi --list-gpus 2>/dev/null | grep -c "^GPU" || true)
+                ok "nvidia-smi sees ${n} NVIDIA device(s)"
+            else
+                warn "nvidia-smi not found -- skipping device check"
+            fi
+        fi
+
+        if [[ "$backend" == "sycl" && $checked_sycl -eq 0 ]]; then
+            checked_sycl=1
+            if command -v icpx >/dev/null 2>&1; then
+                ok "icpx present: $(icpx --version 2>/dev/null | head -1)"
+            elif [[ -f /opt/intel/oneapi/setvars.sh ]]; then
+                ok "oneAPI setvars.sh found (will be sourced at build time)"
+            else
+                fail "icpx not found and no /opt/intel/oneapi/setvars.sh -- install Intel oneAPI (AUR: intel-oneapi-compiler-dpcpp-cpp)"
+            fi
+        fi
     done
 }
 
@@ -587,10 +840,16 @@ main() {
         case "$job" in
             llama-rocm)     build_llama_rocm ;;
             llama-vulkan)   build_llama_vulkan ;;
+            llama-cuda)     build_llama_cuda ;;
+            llama-sycl)     build_llama_sycl ;;
             sd-rocm)        build_sd_rocm ;;
             sd-vulkan)      build_sd_vulkan ;;
+            sd-cuda)        build_sd_cuda ;;
+            sd-sycl)        build_sd_sycl ;;
             whisper-rocm)   build_whisper_rocm ;;
             whisper-vulkan) build_whisper_vulkan ;;
+            whisper-cuda)   build_whisper_cuda ;;
+            whisper-sycl)   build_whisper_sycl ;;
             piper)          build_piper ;;
             tools)          build_llmtools ;;
         esac
@@ -604,10 +863,16 @@ main() {
         case "$job" in
             llama-rocm)     echo -e "  llama   ROCm:   ${ROCM_DIR}/build/bin/llama-server" ;;
             llama-vulkan)   echo -e "  llama   Vulkan: ${VULKAN_DIR}/build/bin/llama-server" ;;
+            llama-cuda)     echo -e "  llama   CUDA:   ${CUDA_DIR}/build/bin/llama-server" ;;
+            llama-sycl)     echo -e "  llama   SYCL:   ${SYCL_DIR}/build/bin/llama-server" ;;
             sd-rocm)        echo -e "  sd      ROCm:   ${SD_ROCM_DIR}/build/bin/{sd-cli,sd-server}" ;;
             sd-vulkan)      echo -e "  sd      Vulkan: ${SD_VULKAN_DIR}/build/bin/{sd-cli,sd-server}" ;;
+            sd-cuda)        echo -e "  sd      CUDA:   ${SD_CUDA_DIR}/build/bin/{sd-cli,sd-server}" ;;
+            sd-sycl)        echo -e "  sd      SYCL:   ${SD_SYCL_DIR}/build/bin/{sd-cli,sd-server}" ;;
             whisper-rocm)   echo -e "  whisper ROCm:   ${WHISPER_ROCM_DIR}/build/bin/whisper-server" ;;
             whisper-vulkan) echo -e "  whisper Vulkan: ${WHISPER_VULKAN_DIR}/build/bin/whisper-server" ;;
+            whisper-cuda)   echo -e "  whisper CUDA:   ${WHISPER_CUDA_DIR}/build/bin/whisper-server" ;;
+            whisper-sycl)   echo -e "  whisper SYCL:   ${WHISPER_SYCL_DIR}/build/bin/whisper-server" ;;
             piper)          echo -e "  piper   TTS:    ${PIPER_VENV}/bin/piper (voice: ${PIPER_VOICE_DIR}/${PIPER_VOICE}.onnx)" ;;
             tools)          echo -e "  tools   venv:   ${TOOLS_VENV}/bin/hf (hf download CLI)" ;;
         esac
