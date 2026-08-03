@@ -3,6 +3,8 @@ llama.cpp-rocm/
 llama.cpp-vulkan/
 stable-diffusion.cpp-rocm/
 stable-diffusion.cpp-vulkan/
+whisper.cpp-rocm/
+whisper.cpp-vulkan/
 stable-diffusion/          
 # ignore if this is a cloned/built web UI; keep if it's yours
 
