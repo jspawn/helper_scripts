@@ -21,6 +21,10 @@
 #  Backends:  rocm, vulkan, cuda, sycl  (default if omitted: rocm vulkan)
 #  Env vars:  JOBS=16        parallelism (default 32)
 #             CUDA_ARCHS=89   CUDA arch list (default "native" = auto-detect)
+#             BIN_DIR=/opt/x  install dir for built binaries (skips the prompt)
+#
+#  At startup the script asks where to install the built binaries
+#  (default: ~/jaynet-bin). Binaries are copied there after each build.
 # ============================================================================
 
 set -euo pipefail
@@ -113,6 +117,44 @@ step() { echo -e "\n${CYAN}${BOLD}==>${NC} ${BOLD}$*${NC}"; }
 ok()   { echo -e "${GREEN}OK${NC} $*"; }
 warn() { echo -e "${YELLOW}!${NC}  $*"; }
 fail() { echo -e "${RED}FAIL${NC} $*"; exit 1; }
+
+# -- Install dir --------------------------------------------------------------
+# Ask where to install the built binaries. Default ~/jaynet-bin; set BIN_DIR
+# to skip the prompt (also skipped automatically when stdin is not a tty).
+BIN_DIR="${BIN_DIR:-}"
+if [[ -z "$BIN_DIR" ]]; then
+    if [[ -t 0 ]]; then
+        read -r -p "Install directory for built binaries [${HOME}/jaynet-bin]: " BIN_DIR
+        BIN_DIR="${BIN_DIR:-${HOME}/jaynet-bin}"
+    else
+        BIN_DIR="${HOME}/jaynet-bin"
+    fi
+fi
+BIN_DIR="${BIN_DIR%/}"
+mkdir -p "$BIN_DIR"
+
+# Copy built binaries into $BIN_DIR. Args: <build/bin dir> <binary>...
+install_bins() {
+    local src="$1"; shift
+    local f
+    for f in "$@"; do
+        if [[ -x "$src/$f" ]]; then
+            cp "$src/$f" "$BIN_DIR/$f"
+            ok "Installed $f -> $BIN_DIR/$f"
+        fi
+    done
+}
+
+# Symlink a venv CLI into $BIN_DIR (copying would break the venv shebang).
+install_link() {
+    local target="$1"
+    local name
+    name="$(basename "$target")"
+    if [[ -x "$target" ]]; then
+        ln -sf "$target" "$BIN_DIR/$name"
+        ok "Linked $name -> $BIN_DIR/$name"
+    fi
+}
 
 # -- Pre-flight checks ------------------------------------------------------
 check_clone() {
@@ -265,6 +307,8 @@ build_llama_rocm() {
     else
         fail "ROCm build produced no llama-server binary"
     fi
+
+    install_bins "$ROCM_DIR/build/bin" llama-server llama-cli llama-bench
 }
 
 # -- llama.cpp Vulkan build -------------------------------------------------
@@ -296,6 +340,8 @@ build_llama_vulkan() {
     else
         fail "Vulkan build produced no llama-server binary"
     fi
+
+    install_bins "$VULKAN_DIR/build/bin" llama-server llama-cli llama-bench
 }
 
 # -- Intel oneAPI environment (for SYCL builds) -------------------------------
@@ -345,6 +391,8 @@ build_llama_cuda() {
     else
         fail "CUDA build produced no llama-server binary"
     fi
+
+    install_bins "$CUDA_DIR/build/bin" llama-server llama-cli llama-bench
 }
 
 # -- llama.cpp SYCL build (Intel oneAPI) ----------------------------------------
@@ -379,6 +427,8 @@ build_llama_sycl() {
     else
         fail "SYCL build produced no llama-server binary"
     fi
+
+    install_bins "$SYCL_DIR/build/bin" llama-server llama-cli llama-bench
 }
 
 # -- whisper.cpp ROCm build ---------------------------------------------------
@@ -413,6 +463,8 @@ build_whisper_rocm() {
     else
         fail "whisper ROCm build produced no whisper-server binary"
     fi
+
+    install_bins "$WHISPER_ROCM_DIR/build/bin" whisper-server whisper-cli
 }
 
 # -- whisper.cpp Vulkan build -------------------------------------------------
@@ -441,6 +493,8 @@ build_whisper_vulkan() {
     else
         fail "whisper Vulkan build produced no whisper-server binary"
     fi
+
+    install_bins "$WHISPER_VULKAN_DIR/build/bin" whisper-server whisper-cli
 }
 
 # -- whisper.cpp CUDA build (NVIDIA) --------------------------------------------
@@ -471,6 +525,8 @@ build_whisper_cuda() {
     else
         fail "whisper CUDA build produced no whisper-server binary"
     fi
+
+    install_bins "$WHISPER_CUDA_DIR/build/bin" whisper-server whisper-cli
 }
 
 # -- whisper.cpp SYCL build (Intel oneAPI) ---------------------------------------
@@ -501,6 +557,8 @@ build_whisper_sycl() {
     else
         fail "whisper SYCL build produced no whisper-server binary"
     fi
+
+    install_bins "$WHISPER_SYCL_DIR/build/bin" whisper-server whisper-cli
 }
 
 # -- piper TTS install (venv, CPU only) ---------------------------------------
@@ -538,6 +596,8 @@ build_piper() {
     else
         fail "piper install produced no piper binary in $PIPER_VENV/bin"
     fi
+
+    install_link "$PIPER_VENV/bin/piper"
 }
 
 # -- llm-tools venv (hf download tooling) -------------------------------------
@@ -563,6 +623,8 @@ build_llmtools() {
     else
         fail "llm-tools install produced no hf binary in $TOOLS_VENV/bin"
     fi
+
+    install_link "$TOOLS_VENV/bin/hf"
 }
 
 # -- stable-diffusion.cpp ROCm build ----------------------------------------
@@ -602,6 +664,8 @@ build_sd_rocm() {
         fail "SD ROCm build produced no sd/sd-cli binary"
     fi
 
+    install_bins "$SD_ROCM_DIR/build/bin" sd sd-cli sd-server
+
     # Build + install web UI from this freshly-synced source tree.
     # Both backends do this; whichever runs second just refreshes the install.
     build_sd_frontend "$SD_ROCM_DIR"
@@ -634,6 +698,8 @@ build_sd_vulkan() {
     else
         fail "SD Vulkan build produced no sd/sd-cli binary"
     fi
+
+    install_bins "$SD_VULKAN_DIR/build/bin" sd sd-cli sd-server
 
     # Build + install web UI from this freshly-synced source tree.
     # Both backends do this; whichever runs second just refreshes the install.
@@ -669,6 +735,8 @@ build_sd_cuda() {
         fail "SD CUDA build produced no sd/sd-cli binary"
     fi
 
+    install_bins "$SD_CUDA_DIR/build/bin" sd sd-cli sd-server
+
     build_sd_frontend "$SD_CUDA_DIR"
 }
 
@@ -700,6 +768,8 @@ build_sd_sycl() {
     else
         fail "SD SYCL build produced no sd/sd-cli binary"
     fi
+
+    install_bins "$SD_SYCL_DIR/build/bin" sd sd-cli sd-server
 
     build_sd_frontend "$SD_SYCL_DIR"
 }
@@ -829,6 +899,7 @@ preflight() {
 main() {
     echo -e "${BOLD}llama.cpp + stable-diffusion.cpp + whisper.cpp build${NC}"
     echo -e "${DIM}Projects: ${PROJECTS[*]} | Backends: ${BACKENDS[*]} | Clean: ${CLEAN} | Jobs: ${JOBS}${NC}"
+    echo -e "${DIM}Install:  ${BIN_DIR}${NC}"
     echo -e "${DIM}Plan:     ${JOBS_LIST[*]}${NC}"
 
     preflight
@@ -858,6 +929,7 @@ main() {
     local elapsed=$(( $(date +%s) - t0 ))
     echo
     echo -e "${GREEN}${BOLD}Done${NC} in ${elapsed}s"
+    echo -e "Binaries installed to ${BOLD}${BIN_DIR}${NC} (add to PATH to use directly)"
     echo
     for job in "${JOBS_LIST[@]}"; do
         case "$job" in
