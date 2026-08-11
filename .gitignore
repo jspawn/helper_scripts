@@ -3,19 +3,23 @@ llama.cpp-rocm/
 llama.cpp-vulkan/
 llama.cpp-cuda/
 llama.cpp-sycl/
+llama.cpp-cpu/
 stable-diffusion.cpp-rocm/
 stable-diffusion.cpp-vulkan/
 stable-diffusion.cpp-cuda/
 stable-diffusion.cpp-sycl/
+stable-diffusion.cpp-cpu/
 whisper.cpp-rocm/
 whisper.cpp-vulkan/
 whisper.cpp-cuda/
 whisper.cpp-sycl/
-stable-diffusion/          
+whisper.cpp-cpu/
+stable-diffusion/
 # ignore if this is a cloned/built web UI; keep if it's yours
 
-# virtualenv
+# virtualenvs
 llm-tools/
+piper/
 
 # models, HF cache, and tokens (large + SECRET)
 models/                    

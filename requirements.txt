@@ -1,10 +1,10 @@
-# llm-tools venv (/srv/llama/llm-tools) — Python tooling for the /srv/llama
-# scripts. Only hf-download.sh needs it today (the `hf` CLI + fast xet
-# transfers). The finetuning stack (torch/transformers/trl/peft) moved to
-# /srv/finetuning/requirements.txt — keep this venv small.
+# llm-tools venv (<checkout>/llm-tools) — Python tooling for this repo:
+# the `hf` CLI + fast xet transfers for model downloads. The finetuning
+# stack (torch/transformers/trl/peft) lives in its own venv — keep this
+# one small.
 #
-# Setup (or just run: /srv/llama/build_tools.sh tools):
-#   python3 -m venv /srv/llama/llm-tools
-#   /srv/llama/llm-tools/bin/pip install -r /srv/llama/requirements.txt
+# Setup (or just run: ./build_tools.sh tools):
+#   python3 -m venv llm-tools
+#   llm-tools/bin/pip install -r requirements.txt
 huggingface_hub>=0.34        # provides the `hf` command
 hf-xet>=1.0                  # fast chunked transfers for hf download

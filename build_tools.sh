@@ -138,6 +138,9 @@ if [[ -z "$BIN_DIR" ]]; then
         BIN_DIR="${HOME}/jaynet-bin"
     fi
 fi
+# read/env values keep a typed ~ literal; expand it so ~/bin doesn't
+# become a literal ./~/bin directory
+BIN_DIR="${BIN_DIR/#\~/${HOME}}"
 BIN_DIR="${BIN_DIR%/}"
 mkdir -p "$BIN_DIR"
 
@@ -299,7 +302,9 @@ build_sd_frontend() {
        && [[ "$src_dir/dist/index.html" -nt "$src_dir/package.json" ]] \
        && [[ "$src_dir/dist/index.html" -nt "$src_dir/vite.config.js" ]]; then
         local newest_src
-        newest_src=$(find "$src_dir/src" -type f -newer "$src_dir/dist/index.html" 2>/dev/null | head -1)
+        # -print -quit: stop at the first newer file; a `| head -1` pipe can
+        # SIGPIPE find mid-stream and kill the script under pipefail
+        newest_src=$(find "$src_dir/src" -type f -newer "$src_dir/dist/index.html" -print -quit 2>/dev/null)
         if [[ -z "$newest_src" ]]; then
             ok "Web UI dist/ in source tree is up to date, skipping rebuild"
             need_build=0
@@ -650,7 +655,11 @@ build_piper() {
         rm -rf "$PIPER_VENV"
     fi
 
-    if [[ ! -x "$PIPER_VENV/bin/pip" ]]; then
+    # A venv moved with the checkout keeps a dead pip shebang (bin/python
+    # still resolves via the system interpreter) — probe pip itself and
+    # recreate when broken, not just when missing
+    if ! "$PIPER_VENV/bin/pip" --version >/dev/null 2>&1; then
+        rm -rf "$PIPER_VENV"
         python3 -m venv "$PIPER_VENV"
     fi
     "$PIPER_VENV/bin/pip" install --quiet --upgrade pip
@@ -689,7 +698,11 @@ build_llmtools() {
         rm -rf "$TOOLS_VENV"
     fi
 
-    if [[ ! -x "$TOOLS_VENV/bin/pip" ]]; then
+    # A venv moved with the checkout keeps a dead pip shebang (bin/python
+    # still resolves via the system interpreter) — probe pip itself and
+    # recreate when broken, not just when missing
+    if ! "$TOOLS_VENV/bin/pip" --version >/dev/null 2>&1; then
+        rm -rf "$TOOLS_VENV"
         python3 -m venv "$TOOLS_VENV"
     fi
     "$TOOLS_VENV/bin/pip" install --quiet --upgrade pip
@@ -1136,17 +1149,24 @@ main() {
         echo -e "    -l 0.0.0.0 --listen-port 1234 --diffusion-fa -v"
     fi
     echo
+    # if/then (not `[[ ]] && echo`): a false trailing &&-list would make
+    # main() — and the whole script — exit 1 after a successful build
     echo -e "${DIM}Quick tests:${NC}"
-    [[ " ${JOBS_LIST[*]} " == *" llama-rocm "* ]] && \
+    if [[ " ${JOBS_LIST[*]} " == *" llama-rocm "* ]]; then
         echo -e "  ${ROCM_DIR}/build/bin/llama-server --list-devices"
-    [[ " ${JOBS_LIST[*]} " == *" sd-rocm "* ]] && \
+    fi
+    if [[ " ${JOBS_LIST[*]} " == *" sd-rocm "* ]]; then
         echo -e "  ${SD_ROCM_DIR}/build/bin/sd-cli --help | head -30"
-    [[ " ${JOBS_LIST[*]} " == *" whisper-rocm "* ]] && \
+    fi
+    if [[ " ${JOBS_LIST[*]} " == *" whisper-rocm "* ]]; then
         echo -e "  ${WHISPER_ROCM_DIR}/build/bin/whisper-server -m ~/jaynet-models/whisper/ggml-small.bin --port 8097"
-    [[ " ${JOBS_LIST[*]} " == *" piper "* ]] && \
+    fi
+    if [[ " ${JOBS_LIST[*]} " == *" piper "* ]]; then
         echo -e "  echo 'hello world' | ${PIPER_VENV}/bin/piper --model ${PIPER_VOICE_DIR}/${PIPER_VOICE}.onnx --output_file /tmp/piper-test.wav"
-    [[ " ${JOBS_LIST[*]} " == *" tools "* ]] && \
+    fi
+    if [[ " ${JOBS_LIST[*]} " == *" tools "* ]]; then
         echo -e "  ${TOOLS_VENV}/bin/hf --version"
+    fi
 }
 
 main
