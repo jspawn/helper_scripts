@@ -2,13 +2,14 @@
 # ============================================================================
 #  build_tools.sh -- Build llama.cpp, stable-diffusion.cpp, whisper.cpp,
 #                     piper TTS, and the llm-tools venv
-#  Hardware: 2x AMD Radeon AI PRO R9700 (gfx1201, RDNA4) / 7950X (znver4)
-#            CUDA (NVIDIA) and SYCL (Intel oneAPI) backends also supported
+#  Backends:  vulkan (default; AMD/NVIDIA/Intel/mixed, no vendor SDK),
+#             rocm (AMD), cuda (NVIDIA), sycl (Intel oneAPI),
+#             cpu (no GPU; AVX2/AVX512/AMX via -march=native)
 #
 #  Usage:
 #    ./build_tools.sh                    # show this help (builds nothing)
-#    ./build_tools.sh all                # all projects, default backends (rocm+vulkan)
-#    ./build_tools.sh llama rocm         # just llama.cpp ROCm
+#    ./build_tools.sh all                # all projects, asks which backends
+#    ./build_tools.sh llama rocm         # just llama.cpp ROCm (skips the menu)
 #    ./build_tools.sh sd vulkan          # just stable-diffusion.cpp Vulkan
 #    ./build_tools.sh whisper cuda       # just whisper.cpp CUDA (NVIDIA)
 #    ./build_tools.sh llama sycl         # just llama.cpp SYCL (Intel oneAPI)
@@ -18,50 +19,68 @@
 #    ./build_tools.sh --clean llama cuda # nuke build dir first, then build
 #
 #  Projects:  llama, sd, whisper, piper, tools, all
-#  Backends:  rocm, vulkan, cuda, sycl  (default if omitted: rocm vulkan)
-#  Env vars:  JOBS=16        parallelism (default 32)
-#             CUDA_ARCHS=89   CUDA arch list (default "native" = auto-detect)
-#             BIN_DIR=/opt/x  install dir for built binaries (skips the prompt)
+#  Backends:  rocm, vulkan, cuda, sycl, cpu
+#             (omitted: menu; non-interactive: vulkan)
+#  Env vars:  JOBS=16                 parallelism (default 32)
+#             BIN_DIR=/opt/x         install dir for built binaries (skips prompt)
+#             AMDGPU_TARGETS=gfx1100 AMD gfx target for ROCm builds (skips prompt)
+#             CUDA_ARCHS=89          CUDA arch list (default "native" = auto)
+#             MARCH=znver4           CPU -march for C/C++ (default "native")
+#             PIPER_VOICE_DIR=...    piper voices dir (default ~/jaynet-models/piper)
 #
 #  At startup the script asks where to install the built binaries
-#  (default: ~/jaynet-bin). Binaries are copied there after each build.
+#  (default: ~/jaynet-bin), then which backends + GPU targets to build for.
+#  Binaries are copied to BIN_DIR after each build.
 # ============================================================================
 
 set -euo pipefail
 
 # -- Paths ------------------------------------------------------------------
-ROCM_DIR="/srv/llama/llama.cpp-rocm"
-VULKAN_DIR="/srv/llama/llama.cpp-vulkan"
-CUDA_DIR="/srv/llama/llama.cpp-cuda"
-SYCL_DIR="/srv/llama/llama.cpp-sycl"
-SD_ROCM_DIR="/srv/llama/stable-diffusion.cpp-rocm"
-SD_VULKAN_DIR="/srv/llama/stable-diffusion.cpp-vulkan"
-SD_CUDA_DIR="/srv/llama/stable-diffusion.cpp-cuda"
-SD_SYCL_DIR="/srv/llama/stable-diffusion.cpp-sycl"
-WHISPER_ROCM_DIR="/srv/llama/whisper.cpp-rocm"
-WHISPER_VULKAN_DIR="/srv/llama/whisper.cpp-vulkan"
-WHISPER_CUDA_DIR="/srv/llama/whisper.cpp-cuda"
-WHISPER_SYCL_DIR="/srv/llama/whisper.cpp-sycl"
-# CUDA target architectures for llama/sd/whisper CUDA builds. "native" lets
-# nvcc detect the installed GPU(s); set e.g. CUDA_ARCHS=89 for a fixed list.
-CUDA_ARCHS="${CUDA_ARCHS:-native}"
+# Base dir = where this script (the repo) is checked out. All source trees,
+# venvs, and install dirs live underneath it.
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROCM_DIR="${BASE_DIR}/llama.cpp-rocm"
+VULKAN_DIR="${BASE_DIR}/llama.cpp-vulkan"
+CUDA_DIR="${BASE_DIR}/llama.cpp-cuda"
+SYCL_DIR="${BASE_DIR}/llama.cpp-sycl"
+SD_ROCM_DIR="${BASE_DIR}/stable-diffusion.cpp-rocm"
+SD_VULKAN_DIR="${BASE_DIR}/stable-diffusion.cpp-vulkan"
+SD_CUDA_DIR="${BASE_DIR}/stable-diffusion.cpp-cuda"
+SD_SYCL_DIR="${BASE_DIR}/stable-diffusion.cpp-sycl"
+WHISPER_ROCM_DIR="${BASE_DIR}/whisper.cpp-rocm"
+WHISPER_VULKAN_DIR="${BASE_DIR}/whisper.cpp-vulkan"
+WHISPER_CUDA_DIR="${BASE_DIR}/whisper.cpp-cuda"
+WHISPER_SYCL_DIR="${BASE_DIR}/whisper.cpp-sycl"
+# CPU-only trees: no GPU backend flags at all; llama.cpp's GGML_NATIVE plus
+# the -march flag below give the host's best SIMD paths (AVX2/AVX512/AMX).
+CPU_DIR="${BASE_DIR}/llama.cpp-cpu"
+SD_CPU_DIR="${BASE_DIR}/stable-diffusion.cpp-cpu"
+WHISPER_CPU_DIR="${BASE_DIR}/whisper.cpp-cpu"
+# GPU/CPU tuning knobs. Empty here = asked later, but only when the matching
+# backend is actually in the build plan; env presets skip the prompts.
+#   AMDGPU_TARGETS: gfx target for ROCm builds (e.g. gfx1100, gfx1201)
+#   CUDA_ARCHS:     CUDA arch list; "native" lets nvcc auto-detect
+#   MARCH:          -march for C/C++ files ("native" = this host's CPU)
+AMDGPU_TARGETS="${AMDGPU_TARGETS:-}"
+CUDA_ARCHS="${CUDA_ARCHS:-}"
+MARCH="${MARCH:-native}"
 # Piper TTS (piper1-gpl) is a Python package -- no GPU backend, no CMake.
 # Installed into a dedicated venv; voices (onnx + onnx.json) live with the
 # other models so the orchestrator's voice.tts.command can reference them.
-PIPER_VENV="/srv/llama/piper/.venv"
-PIPER_VOICE_DIR="/srv/models/piper"
+PIPER_VENV="${BASE_DIR}/piper/.venv"
+PIPER_VOICE_DIR="${PIPER_VOICE_DIR:-${HOME}/jaynet-models/piper}"
 PIPER_VOICE="en_US-lessac-high"
 PIPER_VOICE_BASE="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/high"
 # llm-tools venv: Python tooling for the scripts here (hf-download.sh needs
 # the `hf` CLI). Kept minimal on purpose -- the finetuning stack lives in
 # /srv/finetuning (own requirements.txt, own venv).
-TOOLS_VENV="/srv/llama/llm-tools"
-TOOLS_REQUIREMENTS="/srv/llama/requirements.txt"
+TOOLS_VENV="${BASE_DIR}/llm-tools"
+TOOLS_REQUIREMENTS="${BASE_DIR}/requirements.txt"
 # Shared install location for the SD web UI frontend. The Vite project lives
 # inside each SD source tree at examples/server/frontend, but the built
 # artifacts are copied here so both backends use the same canonical path
 # via --serve-html-path.
-SD_FRONTEND_INSTALL_DIR="/srv/llama/stable-diffusion/web/server/frontend"
+SD_FRONTEND_INSTALL_DIR="${BASE_DIR}/stable-diffusion/web/server/frontend"
 SD_FRONTEND_HTML="${SD_FRONTEND_INSTALL_DIR}/dist/index.html"
 JOBS="${JOBS:-32}"
 
@@ -85,7 +104,7 @@ for arg in "$@"; do
     case "$arg" in
         llama|sd|whisper|piper|tools) PROJECTS+=("$arg") ;;
         all) PROJECTS+=(llama sd whisper piper tools) ;;
-        rocm|vulkan|cuda|sycl) BACKENDS+=("$arg") ;;
+        rocm|vulkan|cuda|sycl|cpu) BACKENDS+=("$arg") ;;
         --clean|-c)  CLEAN=1 ;;
         -h|--help)
             usage
@@ -95,19 +114,8 @@ for arg in "$@"; do
     esac
 done
 [[ ${#PROJECTS[@]} -eq 0 ]] && PROJECTS=(llama sd whisper piper tools)
-[[ ${#BACKENDS[@]} -eq 0 ]] && BACKENDS=(rocm vulkan)
-
-# Build a flat list of (project, backend) jobs to run
-JOBS_LIST=()
-for p in "${PROJECTS[@]}"; do
-    if [[ "$p" == "piper" || "$p" == "tools" ]]; then
-        JOBS_LIST+=("$p")
-        continue
-    fi
-    for b in "${BACKENDS[@]}"; do
-        JOBS_LIST+=("${p}-${b}")
-    done
-done
+# BACKENDS stays empty here on purpose: the menu (after the install-dir
+# prompt) or the non-interactive default fills it in before JOBS_LIST is built.
 
 # -- Colors -----------------------------------------------------------------
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
@@ -155,6 +163,75 @@ install_link() {
         ok "Linked $name -> $BIN_DIR/$name"
     fi
 }
+
+# -- Backend selection ----------------------------------------------------------
+# GPU-less projects (piper, tools) skip this entirely. Menu default = vulkan:
+# one build runs on AMD/NVIDIA/Intel (incl. mixed-vendor splits) with no vendor
+# SDK. Backends given on the command line skip the menu; non-tty -> vulkan.
+GPU_PROJECTS=0
+for p in "${PROJECTS[@]}"; do
+    [[ "$p" == "piper" || "$p" == "tools" ]] || GPU_PROJECTS=1
+done
+
+if [[ ${#BACKENDS[@]} -eq 0 ]]; then
+    if [[ $GPU_PROJECTS -eq 1 && -t 0 ]]; then
+        echo "Backends to build (space-separated numbers) [1]:"
+        echo "  1) vulkan   AMD / NVIDIA / Intel / mixed -- no vendor SDK (default)"
+        echo "  2) rocm     AMD native (needs ROCm, e.g. pacman -S rocm-hip-sdk)"
+        echo "  3) cuda     NVIDIA native (needs the CUDA toolkit)"
+        echo "  4) sycl     Intel oneAPI"
+        echo "  5) cpu      no GPU -- AVX2/AVX512/AMX via -march=native"
+        read -r -p "> " backend_pick
+        backend_pick="${backend_pick:-1}"
+        for n in $backend_pick; do
+            case "$n" in
+                1) BACKENDS+=(vulkan) ;;
+                2) BACKENDS+=(rocm) ;;
+                3) BACKENDS+=(cuda) ;;
+                4) BACKENDS+=(sycl) ;;
+                5) BACKENDS+=(cpu) ;;
+                *) echo "Unknown backend choice: $n" >&2; exit 1 ;;
+            esac
+        done
+    else
+        BACKENDS=(vulkan)
+    fi
+fi
+
+# Build a flat list of (project, backend) jobs to run
+JOBS_LIST=()
+for p in "${PROJECTS[@]}"; do
+    if [[ "$p" == "piper" || "$p" == "tools" ]]; then
+        JOBS_LIST+=("$p")
+        continue
+    fi
+    for b in "${BACKENDS[@]}"; do
+        JOBS_LIST+=("${p}-${b}")
+    done
+done
+
+# -- GPU targets for the native backends -----------------------------------------
+# Asked only when the backend is actually in the job list; env presets skip.
+if [[ -z "$AMDGPU_TARGETS" && " ${JOBS_LIST[*]} " == *"-rocm "* ]]; then
+    if [[ -t 0 ]]; then
+        echo "AMD GPU target for ROCm builds [gfx1201]:"
+        echo "  gfx1030 RX 6800-6950 XT   gfx1031 RX 6700/6750 XT   gfx1032 RX 6600 (XT)"
+        echo "  gfx1100 RX 7900 XT/XTX    gfx1101 RX 7700/7800 XT   gfx1102 RX 7600"
+        echo "  gfx1103 Radeon 780M APU   gfx1151 Strix Halo"
+        echo "  gfx1200 RX 9060 XT        gfx1201 RX 9070 (XT) / AI PRO R9700"
+        read -r -p "> " AMDGPU_TARGETS
+    fi
+    AMDGPU_TARGETS="${AMDGPU_TARGETS:-gfx1201}"
+fi
+if [[ -z "$CUDA_ARCHS" && " ${JOBS_LIST[*]} " == *"-cuda "* ]]; then
+    if [[ -t 0 ]]; then
+        echo "CUDA architectures [native = auto-detect]:"
+        echo "  61 GTX 10xx/P40   75 RTX 20xx/T4   86 RTX 30xx"
+        echo "  89 RTX 40xx/L4/L40   120 RTX 50xx"
+        read -r -p "> " CUDA_ARCHS
+    fi
+    CUDA_ARCHS="${CUDA_ARCHS:-native}"
+fi
 
 # -- Pre-flight checks ------------------------------------------------------
 check_clone() {
@@ -266,7 +343,7 @@ build_llama_rocm() {
         rm -rf build
     fi
 
-    step "Configure ROCm (gfx1201 = R9700)"
+    step "Configure ROCm (${AMDGPU_TARGETS})"
     # Note: hipcc lives in /opt/rocm on Arch via the `rocm-hip-sdk` package
 
     # rocWMMA enables HW-accelerated flash attention on RDNA, but the headers
@@ -289,15 +366,15 @@ build_llama_rocm() {
     # if you ever want the embedded browser UI back.
     cmake -B build \
         -DGGML_HIP=ON \
-        -DAMDGPU_TARGETS=gfx1201 \
+        -DAMDGPU_TARGETS="$AMDGPU_TARGETS" \
         -DGGML_HIP_ROCWMMA_FATTN="$rocwmma_flag" \
         -DLLAMA_BUILD_UI=OFF \
         -DLLAMA_BUILD_WEBUI=OFF \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
         -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
-        -DCMAKE_C_FLAGS="-march=znver4 -O3" \
-        -DCMAKE_CXX_FLAGS="-march=znver4 -O3"
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
     step "Build ROCm (-j${JOBS})"
     cmake --build build --config Release -j"$JOBS" --target llama-server llama-cli llama-bench
@@ -329,8 +406,8 @@ build_llama_vulkan() {
         -DLLAMA_BUILD_UI=OFF \
         -DLLAMA_BUILD_WEBUI=OFF \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_C_FLAGS="-march=znver4 -O3" \
-        -DCMAKE_CXX_FLAGS="-march=znver4 -O3"
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
     step "Build Vulkan (-j${JOBS})"
     cmake --build build --config Release -j"$JOBS" --target llama-server llama-cli llama-bench
@@ -380,8 +457,8 @@ build_llama_cuda() {
         -DLLAMA_BUILD_UI=OFF \
         -DLLAMA_BUILD_WEBUI=OFF \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_C_FLAGS="-march=znver4 -O3" \
-        -DCMAKE_CXX_FLAGS="-march=znver4 -O3"
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
     step "Build CUDA (-j${JOBS})"
     cmake --build build --config Release -j"$JOBS" --target llama-server llama-cli llama-bench
@@ -442,18 +519,18 @@ build_whisper_rocm() {
         rm -rf build
     fi
 
-    step "Configure whisper.cpp ROCm (gfx1201 = R9700)"
+    step "Configure whisper.cpp ROCm (${AMDGPU_TARGETS})"
     # No ffmpeg: the orchestrator web UI sends 16 kHz mono WAV, which
     # whisper-server decodes natively. Add -DWHISPER_FFMPEG=ON if you ever
     # need to feed it arbitrary audio formats.
     cmake -B build \
         -DGGML_HIP=ON \
-        -DAMDGPU_TARGETS=gfx1201 \
+        -DAMDGPU_TARGETS="$AMDGPU_TARGETS" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
         -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
-        -DCMAKE_C_FLAGS="-march=znver4 -O3" \
-        -DCMAKE_CXX_FLAGS="-march=znver4 -O3"
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
     step "Build whisper ROCm (-j${JOBS})"
     cmake --build build --config Release -j"$JOBS" --target whisper-server whisper-cli
@@ -482,8 +559,8 @@ build_whisper_vulkan() {
     cmake -B build \
         -DGGML_VULKAN=ON \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_C_FLAGS="-march=znver4 -O3" \
-        -DCMAKE_CXX_FLAGS="-march=znver4 -O3"
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
     step "Build whisper Vulkan (-j${JOBS})"
     cmake --build build --config Release -j"$JOBS" --target whisper-server whisper-cli
@@ -514,8 +591,8 @@ build_whisper_cuda() {
         -DGGML_CUDA=ON \
         -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_C_FLAGS="-march=znver4 -O3" \
-        -DCMAKE_CXX_FLAGS="-march=znver4 -O3"
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
     step "Build whisper CUDA (-j${JOBS})"
     cmake --build build --config Release -j"$JOBS" --target whisper-server whisper-cli
@@ -638,15 +715,15 @@ build_sd_rocm() {
         rm -rf build
     fi
 
-    step "Configure stable-diffusion.cpp ROCm (gfx1201)"
+    step "Configure stable-diffusion.cpp ROCm (${AMDGPU_TARGETS})"
     # Note: SD uses -DSD_HIPBLAS=ON (not GGML_HIP) and wants both GPU_TARGETS
     # and AMDGPU_TARGETS depending on ROCm version. Ninja is recommended.
     # rocWMMA is kept OFF for SD -- per AUR notes it regressed on ROCm 7+.
     cmake -B build \
         -G Ninja \
         -DSD_HIPBLAS=ON \
-        -DGPU_TARGETS=gfx1201 \
-        -DAMDGPU_TARGETS=gfx1201 \
+        -DGPU_TARGETS="$AMDGPU_TARGETS" \
+        -DAMDGPU_TARGETS="$AMDGPU_TARGETS" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
         -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
@@ -686,8 +763,8 @@ build_sd_vulkan() {
     cmake -B build \
         -DSD_VULKAN=ON \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_C_FLAGS="-march=znver4 -O3" \
-        -DCMAKE_CXX_FLAGS="-march=znver4 -O3"
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
     step "Build SD Vulkan (-j${JOBS})"
     cmake --build build --config Release -j"$JOBS"
@@ -722,8 +799,8 @@ build_sd_cuda() {
         -DSD_CUDA=ON \
         -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_C_FLAGS="-march=znver4 -O3" \
-        -DCMAKE_CXX_FLAGS="-march=znver4 -O3"
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
     step "Build SD CUDA (-j${JOBS})"
     cmake --build build --config Release -j"$JOBS"
@@ -774,6 +851,101 @@ build_sd_sycl() {
     build_sd_frontend "$SD_SYCL_DIR"
 }
 
+# -- CPU-only builds (no GPU backend) ------------------------------------------
+# No GGML_HIP/VULKAN/CUDA/SYCL flags: llama.cpp/whisper.cpp/sd.cpp build their
+# CPU backend with GGML_NATIVE=ON by default, and -march=$MARCH (default
+# "native") unlocks the host's best SIMD paths (AVX2/AVX512, AMX on Xeon).
+# Runtime threading is a llama-server flag (-t), not a build flag.
+build_llama_cpu() {
+    check_clone "$CPU_DIR" "https://github.com/ggml-org/llama.cpp"
+    sync_repo "$CPU_DIR"
+    cd "$CPU_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean CPU build dir"
+        rm -rf build
+    fi
+
+    step "Configure CPU (-march=$MARCH)"
+    cmake -B build \
+        -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_BUILD_WEBUI=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
+
+    step "Build CPU (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" --target llama-server llama-cli llama-bench
+
+    if [[ -x "$CPU_DIR/build/bin/llama-server" ]]; then
+        ok "CPU build at $CPU_DIR/build/bin/llama-server"
+    else
+        fail "CPU build produced no llama-server binary"
+    fi
+
+    install_bins "$CPU_DIR/build/bin" llama-server llama-cli llama-bench
+}
+
+build_whisper_cpu() {
+    check_clone "$WHISPER_CPU_DIR" "https://github.com/ggml-org/whisper.cpp"
+    sync_repo "$WHISPER_CPU_DIR"
+    cd "$WHISPER_CPU_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean whisper CPU build dir"
+        rm -rf build
+    fi
+
+    step "Configure whisper.cpp CPU (-march=$MARCH)"
+    cmake -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
+
+    step "Build whisper CPU (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" --target whisper-server whisper-cli
+
+    if [[ -x "$WHISPER_CPU_DIR/build/bin/whisper-server" ]]; then
+        ok "whisper CPU build at $WHISPER_CPU_DIR/build/bin/whisper-server"
+    else
+        fail "whisper CPU build produced no whisper-server binary"
+    fi
+
+    install_bins "$WHISPER_CPU_DIR/build/bin" whisper-server whisper-cli
+}
+
+build_sd_cpu() {
+    check_clone "$SD_CPU_DIR" "https://github.com/leejet/stable-diffusion.cpp" recursive
+    sync_repo "$SD_CPU_DIR" recursive
+    cd "$SD_CPU_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean SD CPU build dir"
+        rm -rf build
+    fi
+
+    # Works, but expect minutes per image -- CPU SD is a fallback, not a plan.
+    step "Configure stable-diffusion.cpp CPU (-march=$MARCH)"
+    cmake -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
+
+    step "Build SD CPU (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS"
+
+    if [[ -x "$SD_CPU_DIR/build/bin/sd" ]] \
+       || [[ -x "$SD_CPU_DIR/build/bin/sd-cli" ]]; then
+        ok "SD CPU build at $SD_CPU_DIR/build/bin/"
+    else
+        fail "SD CPU build produced no sd/sd-cli binary"
+    fi
+
+    install_bins "$SD_CPU_DIR/build/bin" sd sd-cli sd-server
+
+    build_sd_frontend "$SD_CPU_DIR"
+}
+
 # -- Sanity: toolchain ------------------------------------------------------
 preflight() {
     step "Pre-flight checks"
@@ -821,16 +993,16 @@ preflight() {
             command -v hipcc >/dev/null 2>&1 || fail "hipcc not found -- pacman -S rocm-hip-sdk"
             if ! command -v rocminfo >/dev/null 2>&1; then
                 warn "rocminfo not found -- pacman -S rocminfo (skipping device check)"
-            elif rocminfo 2>/dev/null | grep -q "gfx1201"; then
+            elif rocminfo 2>/dev/null | grep -q "$AMDGPU_TARGETS"; then
                 local n
-                n=$(rocminfo 2>/dev/null | grep -c "Name:.*gfx1201" || true)
-                ok "rocminfo sees ${n} gfx1201 device(s)"
+                n=$(rocminfo 2>/dev/null | grep -c "Name:.*${AMDGPU_TARGETS}" || true)
+                ok "rocminfo sees ${n} ${AMDGPU_TARGETS} device(s)"
             else
-                warn "rocminfo doesn't list gfx1201. Check:"
-                warn "  1. ROCm >= 6.4.1 required for RDNA4 (pacman -Qi rocm-hip-runtime)"
+                warn "rocminfo doesn't list ${AMDGPU_TARGETS}. Check:"
+                warn "  1. ROCm version supports your GPU (pacman -Qi rocm-hip-runtime)"
                 warn "  2. User in render+video groups: groups | grep -E 'render|video'"
                 warn "  3. amdgpu kernel module loaded: lsmod | grep amdgpu"
-                warn "  4. AUR fallback if needed: paru -S rocm-gfx120x-bin"
+                warn "  4. Wrong target picked? Re-run with AMDGPU_TARGETS=<your gfx>"
             fi
             # rocWMMA only matters for llama.cpp (SD has it off intentionally)
             if [[ " ${JOBS_LIST[*]} " == *" llama-rocm "* ]]; then
@@ -921,6 +1093,9 @@ main() {
             whisper-vulkan) build_whisper_vulkan ;;
             whisper-cuda)   build_whisper_cuda ;;
             whisper-sycl)   build_whisper_sycl ;;
+            llama-cpu)      build_llama_cpu ;;
+            sd-cpu)         build_sd_cpu ;;
+            whisper-cpu)    build_whisper_cpu ;;
             piper)          build_piper ;;
             tools)          build_llmtools ;;
         esac
@@ -945,6 +1120,9 @@ main() {
             whisper-vulkan) echo -e "  whisper Vulkan: ${WHISPER_VULKAN_DIR}/build/bin/whisper-server" ;;
             whisper-cuda)   echo -e "  whisper CUDA:   ${WHISPER_CUDA_DIR}/build/bin/whisper-server" ;;
             whisper-sycl)   echo -e "  whisper SYCL:   ${WHISPER_SYCL_DIR}/build/bin/whisper-server" ;;
+            llama-cpu)      echo -e "  llama   CPU:    ${CPU_DIR}/build/bin/llama-server" ;;
+            sd-cpu)         echo -e "  sd      CPU:    ${SD_CPU_DIR}/build/bin/{sd-cli,sd-server}" ;;
+            whisper-cpu)    echo -e "  whisper CPU:    ${WHISPER_CPU_DIR}/build/bin/whisper-server" ;;
             piper)          echo -e "  piper   TTS:    ${PIPER_VENV}/bin/piper (voice: ${PIPER_VOICE_DIR}/${PIPER_VOICE}.onnx)" ;;
             tools)          echo -e "  tools   venv:   ${TOOLS_VENV}/bin/hf (hf download CLI)" ;;
         esac
@@ -964,7 +1142,7 @@ main() {
     [[ " ${JOBS_LIST[*]} " == *" sd-rocm "* ]] && \
         echo -e "  ${SD_ROCM_DIR}/build/bin/sd-cli --help | head -30"
     [[ " ${JOBS_LIST[*]} " == *" whisper-rocm "* ]] && \
-        echo -e "  ${WHISPER_ROCM_DIR}/build/bin/whisper-server -m /srv/models/whisper/ggml-small.bin --port 8097"
+        echo -e "  ${WHISPER_ROCM_DIR}/build/bin/whisper-server -m ~/jaynet-models/whisper/ggml-small.bin --port 8097"
     [[ " ${JOBS_LIST[*]} " == *" piper "* ]] && \
         echo -e "  echo 'hello world' | ${PIPER_VENV}/bin/piper --model ${PIPER_VOICE_DIR}/${PIPER_VOICE}.onnx --output_file /tmp/piper-test.wav"
     [[ " ${JOBS_LIST[*]} " == *" tools "* ]] && \
