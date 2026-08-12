@@ -30,7 +30,10 @@
 #
 #  At startup the script asks where to install the built binaries
 #  (default: ~/jaynet-bin), then which backends + GPU targets to build for.
-#  Binaries are copied to BIN_DIR after each build.
+#  llama.cpp/whisper.cpp install as self-contained VERSIONED prefixes
+#  ($BIN_DIR/llama.cpp.rocm-b10343/{bin,lib}) with a stable symlink
+#  ($BIN_DIR/llama.cpp.rocm -> ...) flipped after each build — a rebuild
+#  never yanks libs from under a running server, rollback is one ln -sf.
 # ============================================================================
 
 set -euo pipefail
@@ -145,6 +148,10 @@ BIN_DIR="${BIN_DIR%/}"
 mkdir -p "$BIN_DIR"
 
 # Copy built binaries into $BIN_DIR. Args: <build/bin dir> <binary>...
+# NOTE: stub-copy only — the copied binaries keep their RUNPATH into the
+# build tree, so they break when the source dir is deleted. Fine for sd.cpp
+# (builds mostly-static) and whisper (not currently served by JayNet); the
+# llama.cpp builds use install_prefix instead.
 install_bins() {
     local src="$1"; shift
     local f
@@ -165,6 +172,41 @@ install_link() {
         ln -sf "$target" "$BIN_DIR/$name"
         ok "Linked $name -> $BIN_DIR/$name"
     fi
+}
+
+# Install a cmake build as a self-contained, versioned prefix and flip a
+# stable symlink to it: $BIN_DIR/<family>.<backend>-<tag>/{bin,lib} with
+# $BIN_DIR/<family>.<backend> -> that dir. We copy build/bin BY HAND instead
+# of cmake --install: upstream writes install rules for every tool (even the
+# ones we never build), so --install dies mid-run with a half-populated
+# prefix. Reinstalling into the SAME prefix would leave stale versioned
+# libs and can mix ABIs — versioned prefixes sidestep that, never yank libs
+# from under a running server, make the flip atomic, and rollback is one
+# `ln -sf` back. Delete old versions by hand.
+# Args: <source tree> <family> <backend> <binary that must exist>
+install_prefix() {
+    local src_dir="$1" family="$2" backend="$3" want="$4"
+    local tag dest link
+    tag="$(git -C "$src_dir" describe --tags --always 2>/dev/null || echo unknown)"
+    dest="$BIN_DIR/${family}.${backend}-${tag}"
+    link="$BIN_DIR/${family}.${backend}"
+    step "Install ${family} (${backend}) -> ${dest}"
+    rm -rf "$dest"
+    mkdir -p "$dest/bin" "$dest/lib"
+    # shared libs (+ their symlinks) -> lib, executables -> bin
+    local f
+    for f in "$src_dir"/build/bin/*.so*; do
+        [[ -e "$f" ]] && cp -a "$f" "$dest/lib/"
+    done
+    find "$src_dir/build/bin" -maxdepth 1 -type f -executable ! -name '*.so*' \
+        -exec cp -a {} "$dest/bin/" \;
+    [[ -x "$dest/bin/$want" ]] || fail "install produced no $want in $dest/bin"
+    # An old stub-copy install leaves a REAL directory at the link path.
+    [[ -d "$link" && ! -L "$link" ]] && rm -rf "$link"
+    ln -sfn "$dest" "$link"
+    ok "$family $backend: $link -> ${dest##*/}"
+    ok "use: $link/bin/$want  (its lib/ must be on LD_LIBRARY_PATH —"
+    ok "  JayNet's start-model.sh prepends <bin>/../lib automatically)"
 }
 
 # -- Backend selection ----------------------------------------------------------
@@ -369,11 +411,14 @@ build_llama_rocm() {
     # dist embed), which is exactly what was breaking the build after the
     # Svelte+PWA web UI rework landed. Drop both flags + `pacman -S nodejs npm`
     # if you ever want the embedded browser UI back.
+    # TESTS=OFF: we only build 3 targets; skipping tests keeps configure lean
+    # (and their broken install rules out of the tree).
     cmake -B build \
         -DGGML_HIP=ON \
         -DAMDGPU_TARGETS="$AMDGPU_TARGETS" \
         -DGGML_HIP_ROCWMMA_FATTN="$rocwmma_flag" \
         -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_WEBUI=OFF \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
@@ -390,7 +435,7 @@ build_llama_rocm() {
         fail "ROCm build produced no llama-server binary"
     fi
 
-    install_bins "$ROCM_DIR/build/bin" llama-server llama-cli llama-bench
+    install_prefix "$ROCM_DIR" llama.cpp rocm llama-server
 }
 
 # -- llama.cpp Vulkan build -------------------------------------------------
@@ -409,6 +454,7 @@ build_llama_vulkan() {
     cmake -B build \
         -DGGML_VULKAN=ON \
         -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_WEBUI=OFF \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
@@ -423,7 +469,7 @@ build_llama_vulkan() {
         fail "Vulkan build produced no llama-server binary"
     fi
 
-    install_bins "$VULKAN_DIR/build/bin" llama-server llama-cli llama-bench
+    install_prefix "$VULKAN_DIR" llama.cpp vulkan llama-server
 }
 
 # -- Intel oneAPI environment (for SYCL builds) -------------------------------
@@ -460,6 +506,7 @@ build_llama_cuda() {
         -DGGML_CUDA=ON \
         -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
         -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_WEBUI=OFF \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
@@ -474,7 +521,7 @@ build_llama_cuda() {
         fail "CUDA build produced no llama-server binary"
     fi
 
-    install_bins "$CUDA_DIR/build/bin" llama-server llama-cli llama-bench
+    install_prefix "$CUDA_DIR" llama.cpp cuda llama-server
 }
 
 # -- llama.cpp SYCL build (Intel oneAPI) ----------------------------------------
@@ -496,6 +543,7 @@ build_llama_sycl() {
     cmake -B build \
         -DGGML_SYCL=ON \
         -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_WEBUI=OFF \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_COMPILER=icx \
@@ -510,7 +558,7 @@ build_llama_sycl() {
         fail "SYCL build produced no llama-server binary"
     fi
 
-    install_bins "$SYCL_DIR/build/bin" llama-server llama-cli llama-bench
+    install_prefix "$SYCL_DIR" llama.cpp sycl llama-server
 }
 
 # -- whisper.cpp ROCm build ---------------------------------------------------
@@ -882,6 +930,7 @@ build_llama_cpu() {
     step "Configure CPU (-march=$MARCH)"
     cmake -B build \
         -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_WEBUI=OFF \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
@@ -896,7 +945,7 @@ build_llama_cpu() {
         fail "CPU build produced no llama-server binary"
     fi
 
-    install_bins "$CPU_DIR/build/bin" llama-server llama-cli llama-bench
+    install_prefix "$CPU_DIR" llama.cpp cpu llama-server
 }
 
 build_whisper_cpu() {
