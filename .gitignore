@@ -14,6 +14,12 @@ whisper.cpp-vulkan/
 whisper.cpp-cuda/
 whisper.cpp-sycl/
 whisper.cpp-cpu/
+llama.cpp-k2horizon-rocm/
+llama.cpp-k2horizon-vulkan/
+llama.cpp-k2horizon-cuda/
+llama.cpp-k2horizon-cpu/
+# downloaded K2-Horizon patches (re-fetched by build_tools.sh when missing)
+patches/
 stable-diffusion/
 # ignore if this is a cloned/built web UI; keep if it's yours
 

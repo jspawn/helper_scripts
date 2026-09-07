@@ -17,8 +17,10 @@
 #    ./build_tools.sh piper              # piper TTS (venv install, no GPU backend)
 #    ./build_tools.sh tools              # llm-tools venv (hf download tooling)
 #    ./build_tools.sh --clean llama cuda # nuke build dir first, then build
+#    ./build_tools.sh k2horizon rocm     # patched K2-Horizon llama.cpp fork
 #
-#  Projects:  llama, sd, whisper, piper, tools, all
+#  Projects:  llama, sd, whisper, piper, tools, k2horizon, all
+#             (k2horizon is NOT part of "all" -- experimental patched fork)
 #  Backends:  rocm, vulkan, cuda, sycl, cpu
 #             (omitted: menu; non-interactive: vulkan)
 #  Env vars:  JOBS=16                 parallelism (default 32)
@@ -59,6 +61,21 @@ WHISPER_SYCL_DIR="${BASE_DIR}/whisper.cpp-sycl"
 CPU_DIR="${BASE_DIR}/llama.cpp-cpu"
 SD_CPU_DIR="${BASE_DIR}/stable-diffusion.cpp-cpu"
 WHISPER_CPU_DIR="${BASE_DIR}/whisper.cpp-cpu"
+# K2-Horizon fork: upstream llama.cpp has no k2-horizon arch support yet; the
+# model cards (e.g. vincespeed/K2-Horizon-MoVA-36B-A4B-APEX-GGUF) require the
+# MBZUAI-IFM fork at a pinned commit plus two patches (MSVC tokenizer regex --
+# Windows-only but harmless here; parallel-norm residual wiring -- required on
+# every OS, otherwise garbage "> > >" output). NOT synced to HEAD like the
+# other trees: the pin is the point.
+K2_REPO="https://github.com/MBZUAI-IFM/llama.cpp"
+K2_COMMIT="35999d101cf2233fc54f09c3c8d599da7303ce02"
+K2_PATCH_DIR="${BASE_DIR}/patches/k2horizon"
+K2_PATCH_BASE="https://huggingface.co/vincespeed/K2-Horizon-MoVA-36B-A4B-APEX-GGUF/resolve/main/patches"
+K2_PATCHES=(0001-fix-k2-horizon-msvc-regex.patch 0002-fix-k2-horizon-parallel-norm.patch)
+K2_ROCM_DIR="${BASE_DIR}/llama.cpp-k2horizon-rocm"
+K2_VULKAN_DIR="${BASE_DIR}/llama.cpp-k2horizon-vulkan"
+K2_CUDA_DIR="${BASE_DIR}/llama.cpp-k2horizon-cuda"
+K2_CPU_DIR="${BASE_DIR}/llama.cpp-k2horizon-cpu"
 # GPU/CPU tuning knobs. Empty here = asked later, but only when the matching
 # backend is actually in the build plan; env presets skip the prompts.
 #   AMDGPU_TARGETS: gfx target for ROCm builds (e.g. gfx1100, gfx1201)
@@ -105,7 +122,7 @@ BACKENDS=()
 CLEAN=0
 for arg in "$@"; do
     case "$arg" in
-        llama|sd|whisper|piper|tools) PROJECTS+=("$arg") ;;
+        llama|sd|whisper|piper|tools|k2horizon) PROJECTS+=("$arg") ;;
         all) PROJECTS+=(llama sd whisper piper tools) ;;
         rocm|vulkan|cuda|sycl|cpu) BACKENDS+=("$arg") ;;
         --clean|-c)  CLEAN=1 ;;
@@ -1008,6 +1025,189 @@ build_sd_cpu() {
     build_sd_frontend "$SD_CPU_DIR"
 }
 
+# -- K2-Horizon fork helpers --------------------------------------------------
+# Clone (if missing) and pin the tree at K2_COMMIT. Unlike sync_repo this
+# never pulls: the model cards validate against one exact commit, and the two
+# patches apply on top of it. Patches leave the tree dirty by design -- a
+# clean tree NOT at the pin is checked out; a dirty tree not at the pin is an
+# unknown state and aborts.
+sync_k2_repo() {
+    local dir="$1"
+    if [[ ! -d "$dir/.git" ]]; then
+        warn "$dir not found, cloning K2-Horizon fork..."
+        git clone "$K2_REPO" "$dir"
+    fi
+    cd "$dir"
+    if [[ "$(git rev-parse HEAD)" != "$K2_COMMIT" ]]; then
+        if git diff --quiet && git diff --cached --quiet; then
+            step "Pin K2-Horizon fork at ${K2_COMMIT:0:12}"
+            git fetch --quiet origin
+            git checkout --quiet "$K2_COMMIT"
+        else
+            fail "$dir is not at the pinned K2 commit and has local changes -- resolve manually"
+        fi
+    fi
+    ok "K2-Horizon fork at $(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)"
+}
+
+# Download the two model-card patches once into patches/k2horizon/ and apply
+# them idempotently (skip when already applied, fail when they match neither
+# way -- that means the fork moved and the pin/patches need a revisit).
+apply_k2_patches() {
+    local dir="$1"
+    mkdir -p "$K2_PATCH_DIR"
+    local f p
+    for f in "${K2_PATCHES[@]}"; do
+        p="$K2_PATCH_DIR/$f"
+        if [[ ! -s "$p" ]]; then
+            step "Download K2 patch $f"
+            curl -fL --progress-bar -o "$p" "$K2_PATCH_BASE/$f" \
+                || fail "patch download failed: $f"
+        fi
+        if git -C "$dir" apply --check "$p" 2>/dev/null; then
+            git -C "$dir" apply "$p" && ok "applied $f"
+        elif git -C "$dir" apply --reverse --check "$p" 2>/dev/null; then
+            ok "$f already applied"
+        else
+            fail "patch $f applies neither forward nor reverse -- fork moved? Check K2_COMMIT."
+        fi
+    done
+}
+
+# -- llama.cpp K2-Horizon builds (patched fork; rocm/vulkan/cuda/cpu) ---------
+# Same flags as the matching vanilla builds; unknown flags on the (older)
+# fork only trigger cmake warnings, not errors. Installs as its own family
+# (llama.cpp-k2horizon.<backend>) so it never clobbers the vanilla prefixes.
+build_k2horizon_rocm() {
+    sync_k2_repo "$K2_ROCM_DIR"
+    apply_k2_patches "$K2_ROCM_DIR"
+    cd "$K2_ROCM_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean K2 ROCm build dir"
+        rm -rf build
+    fi
+
+    local rocwmma_flag="OFF"
+    if [[ -f "/opt/rocm/include/rocwmma/rocwmma-version.hpp" ]] \
+       || [[ -f "/usr/include/rocwmma/rocwmma-version.hpp" ]]; then
+        rocwmma_flag="ON"
+    fi
+
+    step "Configure K2-Horizon ROCm (${AMDGPU_TARGETS})"
+    cmake -B build \
+        -DGGML_HIP=ON \
+        -DAMDGPU_TARGETS="$AMDGPU_TARGETS" \
+        -DGGML_HIP_ROCWMMA_FATTN="$rocwmma_flag" \
+        -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_WEBUI=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
+        -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
+
+    step "Build K2-Horizon ROCm (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" --target llama-server llama-cli llama-bench
+
+    [[ -x "$K2_ROCM_DIR/build/bin/llama-server" ]] \
+        || fail "K2 ROCm build produced no llama-server binary"
+    ok "K2 ROCm build at $K2_ROCM_DIR/build/bin/llama-server"
+
+    install_prefix "$K2_ROCM_DIR" llama.cpp-k2horizon rocm llama-server
+}
+
+build_k2horizon_vulkan() {
+    sync_k2_repo "$K2_VULKAN_DIR"
+    apply_k2_patches "$K2_VULKAN_DIR"
+    cd "$K2_VULKAN_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean K2 Vulkan build dir"
+        rm -rf build
+    fi
+
+    step "Configure K2-Horizon Vulkan"
+    cmake -B build \
+        -DGGML_VULKAN=ON \
+        -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_WEBUI=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
+
+    step "Build K2-Horizon Vulkan (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" --target llama-server llama-cli llama-bench
+
+    [[ -x "$K2_VULKAN_DIR/build/bin/llama-server" ]] \
+        || fail "K2 Vulkan build produced no llama-server binary"
+    ok "K2 Vulkan build at $K2_VULKAN_DIR/build/bin/llama-server"
+
+    install_prefix "$K2_VULKAN_DIR" llama.cpp-k2horizon vulkan llama-server
+}
+
+build_k2horizon_cuda() {
+    sync_k2_repo "$K2_CUDA_DIR"
+    apply_k2_patches "$K2_CUDA_DIR"
+    cd "$K2_CUDA_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean K2 CUDA build dir"
+        rm -rf build
+    fi
+
+    step "Configure K2-Horizon CUDA (archs: ${CUDA_ARCHS})"
+    cmake -B build \
+        -DGGML_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
+        -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_WEBUI=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
+
+    step "Build K2-Horizon CUDA (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" --target llama-server llama-cli llama-bench
+
+    [[ -x "$K2_CUDA_DIR/build/bin/llama-server" ]] \
+        || fail "K2 CUDA build produced no llama-server binary"
+    ok "K2 CUDA build at $K2_CUDA_DIR/build/bin/llama-server"
+
+    install_prefix "$K2_CUDA_DIR" llama.cpp-k2horizon cuda llama-server
+}
+
+build_k2horizon_cpu() {
+    sync_k2_repo "$K2_CPU_DIR"
+    apply_k2_patches "$K2_CPU_DIR"
+    cd "$K2_CPU_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean K2 CPU build dir"
+        rm -rf build
+    fi
+
+    step "Configure K2-Horizon CPU (-march=$MARCH)"
+    cmake -B build \
+        -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_WEBUI=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
+
+    step "Build K2-Horizon CPU (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" --target llama-server llama-cli llama-bench
+
+    [[ -x "$K2_CPU_DIR/build/bin/llama-server" ]] \
+        || fail "K2 CPU build produced no llama-server binary"
+    ok "K2 CPU build at $K2_CPU_DIR/build/bin/llama-server"
+
+    install_prefix "$K2_CPU_DIR" llama.cpp-k2horizon cpu llama-server
+}
+
 # -- Sanity: toolchain ------------------------------------------------------
 preflight() {
     step "Pre-flight checks"
@@ -1030,6 +1230,10 @@ preflight() {
     if [[ " ${JOBS_LIST[*]} " == *" piper "* ]]; then
         command -v curl >/dev/null 2>&1 \
             || fail "curl not found (required for piper voice download)"
+    fi
+    if [[ " ${JOBS_LIST[*]} " == *" k2horizon-"* ]]; then
+        command -v curl >/dev/null 2>&1 \
+            || fail "curl not found (required for K2-Horizon patch download)"
     fi
 
     # pnpm/npm required for SD web UI -- warn once if any SD backend is built
@@ -1156,6 +1360,10 @@ main() {
             whisper-cuda)   build_whisper_cuda ;;
             whisper-sycl)   build_whisper_sycl ;;
             llama-cpu)      build_llama_cpu ;;
+            k2horizon-rocm)   build_k2horizon_rocm ;;
+            k2horizon-vulkan) build_k2horizon_vulkan ;;
+            k2horizon-cuda)   build_k2horizon_cuda ;;
+            k2horizon-cpu)    build_k2horizon_cpu ;;
             sd-cpu)         build_sd_cpu ;;
             whisper-cpu)    build_whisper_cpu ;;
             piper)          build_piper ;;
@@ -1183,6 +1391,10 @@ main() {
             whisper-cuda)   echo -e "  whisper CUDA:   ${WHISPER_CUDA_DIR}/build/bin/whisper-server" ;;
             whisper-sycl)   echo -e "  whisper SYCL:   ${WHISPER_SYCL_DIR}/build/bin/whisper-server" ;;
             llama-cpu)      echo -e "  llama   CPU:    ${CPU_DIR}/build/bin/llama-server" ;;
+            k2horizon-rocm)   echo -e "  k2horizon ROCm:   ${BIN_DIR}/llama.cpp-k2horizon.rocm/bin/llama-server" ;;
+            k2horizon-vulkan) echo -e "  k2horizon Vulkan: ${BIN_DIR}/llama.cpp-k2horizon.vulkan/bin/llama-server" ;;
+            k2horizon-cuda)   echo -e "  k2horizon CUDA:   ${BIN_DIR}/llama.cpp-k2horizon.cuda/bin/llama-server" ;;
+            k2horizon-cpu)    echo -e "  k2horizon CPU:    ${BIN_DIR}/llama.cpp-k2horizon.cpu/bin/llama-server" ;;
             sd-cpu)         echo -e "  sd      CPU:    ${SD_CPU_DIR}/build/bin/{sd-cli,sd-server}" ;;
             whisper-cpu)    echo -e "  whisper CPU:    ${WHISPER_CPU_DIR}/build/bin/whisper-server" ;;
             piper)          echo -e "  piper   TTS:    ${PIPER_VENV}/bin/piper (voice: ${PIPER_VOICE_DIR}/${PIPER_VOICE}.onnx)" ;;
