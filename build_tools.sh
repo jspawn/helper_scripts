@@ -18,9 +18,15 @@
 #    ./build_tools.sh tools              # llm-tools venv (hf download tooling)
 #    ./build_tools.sh --clean llama cuda # nuke build dir first, then build
 #    ./build_tools.sh k2horizon rocm     # patched K2-Horizon llama.cpp fork
+#    ./build_tools.sh update             # rebuild everything already built
+#                                         # (every source tree/venv present —
+#                                         #  syncs to latest, k2horizon keeps
+#                                         #  its pin; add --clean to rebuild
+#                                         #  from scratch)
 #
 #  Projects:  llama, sd, whisper, piper, tools, k2horizon, all
 #             (k2horizon is NOT part of "all" -- experimental patched fork)
+#  Special:   update -- rebuild every tree/venv already present (see above)
 #  Backends:  rocm, vulkan, cuda, sycl, cpu
 #             (omitted: menu; non-interactive: vulkan)
 #  Env vars:  JOBS=16                 parallelism (default 32)
@@ -120,11 +126,13 @@ fi
 PROJECTS=()
 BACKENDS=()
 CLEAN=0
+UPDATE=0
 for arg in "$@"; do
     case "$arg" in
         llama|sd|whisper|piper|tools|k2horizon) PROJECTS+=("$arg") ;;
         all) PROJECTS+=(llama sd whisper piper tools) ;;
         rocm|vulkan|cuda|sycl|cpu) BACKENDS+=("$arg") ;;
+        update) UPDATE=1 ;;
         --clean|-c)  CLEAN=1 ;;
         -h|--help)
             usage
@@ -133,7 +141,7 @@ for arg in "$@"; do
         *) echo "Unknown arg: $arg (try --help)"; exit 1 ;;
     esac
 done
-[[ ${#PROJECTS[@]} -eq 0 ]] && PROJECTS=(llama sd whisper piper tools)
+[[ ${#PROJECTS[@]} -eq 0 && $UPDATE -eq 0 ]] && PROJECTS=(llama sd whisper piper tools)
 # BACKENDS stays empty here on purpose: the menu (after the install-dir
 # prompt) or the non-interactive default fills it in before JOBS_LIST is built.
 
@@ -226,6 +234,45 @@ install_prefix() {
     ok "  JayNet's start-model.sh prepends <bin>/../lib automatically)"
 }
 
+# -- Update mode ---------------------------------------------------------------
+# `update` rebuilds exactly what's already built: every source tree/venv under
+# this checkout maps 1:1 to a (project, backend) job. sync_repo pulls latest;
+# the K2 fork re-pins + re-applies its patches by design. Nothing is cloned
+# here — a tree that doesn't exist was never built and stays untouched.
+if [[ $UPDATE -eq 1 ]]; then
+    JOBS_LIST=()
+    for pair in \
+        "$ROCM_DIR:llama-rocm"           "$VULKAN_DIR:llama-vulkan" \
+        "$CUDA_DIR:llama-cuda"           "$SYCL_DIR:llama-sycl" \
+        "$CPU_DIR:llama-cpu" \
+        "$SD_ROCM_DIR:sd-rocm"           "$SD_VULKAN_DIR:sd-vulkan" \
+        "$SD_CUDA_DIR:sd-cuda"           "$SD_SYCL_DIR:sd-sycl" \
+        "$SD_CPU_DIR:sd-cpu" \
+        "$WHISPER_ROCM_DIR:whisper-rocm" "$WHISPER_VULKAN_DIR:whisper-vulkan" \
+        "$WHISPER_CUDA_DIR:whisper-cuda" "$WHISPER_SYCL_DIR:whisper-sycl" \
+        "$WHISPER_CPU_DIR:whisper-cpu" \
+        "$K2_ROCM_DIR:k2horizon-rocm"    "$K2_VULKAN_DIR:k2horizon-vulkan" \
+        "$K2_CUDA_DIR:k2horizon-cuda"    "$K2_CPU_DIR:k2horizon-cpu" \
+    ; do
+        [[ -d "${pair%%:*}/.git" ]] && JOBS_LIST+=("${pair##*:}")
+    done
+    [[ -d "$PIPER_VENV" ]] && JOBS_LIST+=(piper)
+    [[ -d "$TOOLS_VENV/bin" ]] && JOBS_LIST+=(tools)
+    [[ ${#JOBS_LIST[@]} -eq 0 ]] \
+        && fail "update: no existing builds found under $BASE_DIR — run a normal build first"
+    # PROJECTS/BACKENDS only feed the banner + menu from here on; reconstruct
+    # them (deduped) so the plan line reads sensibly.
+    PROJECTS=(); BACKENDS=()
+    for j in "${JOBS_LIST[@]}"; do
+        case "$j" in
+            piper|tools) PROJECTS+=("$j") ;;
+            *) [[ " ${PROJECTS[*]} " == *" ${j%%-*} "* ]] || PROJECTS+=("${j%%-*}")
+               [[ " ${BACKENDS[*]} " == *" ${j##*-} "* ]] || BACKENDS+=("${j##*-}") ;;
+        esac
+    done
+    step "Update plan (existing builds): ${JOBS_LIST[*]}"
+fi
+
 # -- Backend selection ----------------------------------------------------------
 # GPU-less projects (piper, tools) skip this entirely. Menu default = vulkan:
 # one build runs on AMD/NVIDIA/Intel (incl. mixed-vendor splits) with no vendor
@@ -235,7 +282,7 @@ for p in "${PROJECTS[@]}"; do
     [[ "$p" == "piper" || "$p" == "tools" ]] || GPU_PROJECTS=1
 done
 
-if [[ ${#BACKENDS[@]} -eq 0 ]]; then
+if [[ ${#BACKENDS[@]} -eq 0 && $UPDATE -eq 0 ]]; then
     if [[ $GPU_PROJECTS -eq 1 && -t 0 ]]; then
         echo "Backends to build (space-separated numbers) [1]:"
         echo "  1) vulkan   AMD / NVIDIA / Intel / mixed -- no vendor SDK (default)"
@@ -260,7 +307,9 @@ if [[ ${#BACKENDS[@]} -eq 0 ]]; then
     fi
 fi
 
-# Build a flat list of (project, backend) jobs to run
+# Build a flat list of (project, backend) jobs to run (update mode already
+# built its own JOBS_LIST from the trees on disk)
+if [[ $UPDATE -eq 0 ]]; then
 JOBS_LIST=()
 for p in "${PROJECTS[@]}"; do
     if [[ "$p" == "piper" || "$p" == "tools" ]]; then
@@ -271,6 +320,7 @@ for p in "${PROJECTS[@]}"; do
         JOBS_LIST+=("${p}-${b}")
     done
 done
+fi
 
 # -- GPU targets for the native backends -----------------------------------------
 # Asked only when the backend is actually in the job list; env presets skip.
@@ -1430,4 +1480,9 @@ main() {
     fi
 }
 
-main
+# BUILD_TOOLS_NO_MAIN=1: print the resolved plan and stop (testing/dry-run)
+if [[ "${BUILD_TOOLS_NO_MAIN:-}" == "1" ]]; then
+    echo "PLAN: ${JOBS_LIST[*]}"
+else
+    main
+fi
