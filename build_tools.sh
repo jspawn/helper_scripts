@@ -175,8 +175,8 @@ mkdir -p "$BIN_DIR"
 # Copy built binaries into $BIN_DIR. Args: <build/bin dir> <binary>...
 # NOTE: stub-copy only — the copied binaries keep their RUNPATH into the
 # build tree, so they break when the source dir is deleted. Fine for sd.cpp
-# (builds mostly-static) and whisper (not currently served by JayNet); the
-# llama.cpp builds use install_prefix instead.
+# (builds mostly-static); llama.cpp AND whisper.cpp use install_prefix
+# instead (both are served long-running by JayNet).
 install_bins() {
     local src="$1"; shift
     local f
@@ -661,7 +661,7 @@ build_whisper_rocm() {
         fail "whisper ROCm build produced no whisper-server binary"
     fi
 
-    install_bins "$WHISPER_ROCM_DIR/build/bin" whisper-server whisper-cli
+    install_prefix "$WHISPER_ROCM_DIR" whisper.cpp rocm whisper-server
 }
 
 # -- whisper.cpp Vulkan build -------------------------------------------------
@@ -691,7 +691,7 @@ build_whisper_vulkan() {
         fail "whisper Vulkan build produced no whisper-server binary"
     fi
 
-    install_bins "$WHISPER_VULKAN_DIR/build/bin" whisper-server whisper-cli
+    install_prefix "$WHISPER_VULKAN_DIR" whisper.cpp vulkan whisper-server
 }
 
 # -- whisper.cpp CUDA build (NVIDIA) --------------------------------------------
@@ -723,7 +723,7 @@ build_whisper_cuda() {
         fail "whisper CUDA build produced no whisper-server binary"
     fi
 
-    install_bins "$WHISPER_CUDA_DIR/build/bin" whisper-server whisper-cli
+    install_prefix "$WHISPER_CUDA_DIR" whisper.cpp cuda whisper-server
 }
 
 # -- whisper.cpp SYCL build (Intel oneAPI) ---------------------------------------
@@ -755,7 +755,7 @@ build_whisper_sycl() {
         fail "whisper SYCL build produced no whisper-server binary"
     fi
 
-    install_bins "$WHISPER_SYCL_DIR/build/bin" whisper-server whisper-cli
+    install_prefix "$WHISPER_SYCL_DIR" whisper.cpp sycl whisper-server
 }
 
 # -- piper TTS install (venv, CPU only) ---------------------------------------
@@ -1040,7 +1040,7 @@ build_whisper_cpu() {
         fail "whisper CPU build produced no whisper-server binary"
     fi
 
-    install_bins "$WHISPER_CPU_DIR/build/bin" whisper-server whisper-cli
+    install_prefix "$WHISPER_CPU_DIR" whisper.cpp cpu whisper-server
 }
 
 build_sd_cpu() {
@@ -1436,17 +1436,17 @@ main() {
             sd-vulkan)      echo -e "  sd      Vulkan: ${SD_VULKAN_DIR}/build/bin/{sd-cli,sd-server}" ;;
             sd-cuda)        echo -e "  sd      CUDA:   ${SD_CUDA_DIR}/build/bin/{sd-cli,sd-server}" ;;
             sd-sycl)        echo -e "  sd      SYCL:   ${SD_SYCL_DIR}/build/bin/{sd-cli,sd-server}" ;;
-            whisper-rocm)   echo -e "  whisper ROCm:   ${WHISPER_ROCM_DIR}/build/bin/whisper-server" ;;
-            whisper-vulkan) echo -e "  whisper Vulkan: ${WHISPER_VULKAN_DIR}/build/bin/whisper-server" ;;
-            whisper-cuda)   echo -e "  whisper CUDA:   ${WHISPER_CUDA_DIR}/build/bin/whisper-server" ;;
-            whisper-sycl)   echo -e "  whisper SYCL:   ${WHISPER_SYCL_DIR}/build/bin/whisper-server" ;;
+            whisper-rocm)   echo -e "  whisper ROCm:   ${BIN_DIR}/whisper.cpp.rocm/bin/whisper-server" ;;
+            whisper-vulkan) echo -e "  whisper Vulkan: ${BIN_DIR}/whisper.cpp.vulkan/bin/whisper-server" ;;
+            whisper-cuda)   echo -e "  whisper CUDA:   ${BIN_DIR}/whisper.cpp.cuda/bin/whisper-server" ;;
+            whisper-sycl)   echo -e "  whisper SYCL:   ${BIN_DIR}/whisper.cpp.sycl/bin/whisper-server" ;;
             llama-cpu)      echo -e "  llama   CPU:    ${CPU_DIR}/build/bin/llama-server" ;;
             k2horizon-rocm)   echo -e "  k2horizon ROCm:   ${BIN_DIR}/llama.cpp-k2horizon.rocm/bin/llama-server" ;;
             k2horizon-vulkan) echo -e "  k2horizon Vulkan: ${BIN_DIR}/llama.cpp-k2horizon.vulkan/bin/llama-server" ;;
             k2horizon-cuda)   echo -e "  k2horizon CUDA:   ${BIN_DIR}/llama.cpp-k2horizon.cuda/bin/llama-server" ;;
             k2horizon-cpu)    echo -e "  k2horizon CPU:    ${BIN_DIR}/llama.cpp-k2horizon.cpu/bin/llama-server" ;;
             sd-cpu)         echo -e "  sd      CPU:    ${SD_CPU_DIR}/build/bin/{sd-cli,sd-server}" ;;
-            whisper-cpu)    echo -e "  whisper CPU:    ${WHISPER_CPU_DIR}/build/bin/whisper-server" ;;
+            whisper-cpu)    echo -e "  whisper CPU:    ${BIN_DIR}/whisper.cpp.cpu/bin/whisper-server" ;;
             piper)          echo -e "  piper   TTS:    ${PIPER_VENV}/bin/piper (voice: ${PIPER_VOICE_DIR}/${PIPER_VOICE}.onnx)" ;;
             tools)          echo -e "  tools   venv:   ${TOOLS_VENV}/bin/hf (hf download CLI)" ;;
         esac
@@ -1470,7 +1470,7 @@ main() {
         echo -e "  ${SD_ROCM_DIR}/build/bin/sd-cli --help | head -30"
     fi
     if [[ " ${JOBS_LIST[*]} " == *" whisper-rocm "* ]]; then
-        echo -e "  ${WHISPER_ROCM_DIR}/build/bin/whisper-server -m ~/jaynet-models/whisper/ggml-small.bin --port 8097"
+        echo -e "  ${BIN_DIR}/whisper.cpp.rocm/bin/whisper-server -m ~/jaynet-models/whisper/ggml-small.bin --port 8097"
     fi
     if [[ " ${JOBS_LIST[*]} " == *" piper "* ]]; then
         echo -e "  echo 'hello world' | ${PIPER_VENV}/bin/piper --model ${PIPER_VOICE_DIR}/${PIPER_VOICE}.onnx --output_file /tmp/piper-test.wav"
