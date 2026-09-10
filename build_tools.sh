@@ -30,7 +30,8 @@
 #  Backends:  rocm, vulkan, cuda, sycl, cpu
 #             (omitted: menu; non-interactive: vulkan)
 #  Env vars:  JOBS=16                 parallelism (default 32)
-#             BIN_DIR=/opt/x         install dir for built binaries (skips prompt)
+#             BIN_DIR=/opt/x         install dir for built binaries (skips prompt;
+#                                        last choice persists in ~/.config/jaynet-build-tools.env)
 #             AMDGPU_TARGETS=gfx1100 AMD gfx target for ROCm builds (skips prompt)
 #             CUDA_ARCHS=89          CUDA arch list (default "native" = auto)
 #             MARCH=znver4           CPU -march for C/C++ (default "native")
@@ -155,8 +156,16 @@ warn() { echo -e "${YELLOW}!${NC}  $*"; }
 fail() { echo -e "${RED}FAIL${NC} $*"; exit 1; }
 
 # -- Install dir --------------------------------------------------------------
-# Ask where to install the built binaries. Default ~/jaynet-bin; set BIN_DIR
-# to skip the prompt (also skipped automatically when stdin is not a tty).
+# Ask where to install the built binaries. Default: the dir you used last
+# time (persisted in $_BIN_STATE), else ~/jaynet-bin. BIN_DIR env overrides
+# both; the prompt is also skipped when stdin is not a tty (then the
+# persisted/default dir is used silently). The persistence exists because a
+# re-clone must not silently relocate the install dir — JayNet's binary
+# registry points at the stable symlinks under $BIN_DIR.
+_BIN_STATE="${XDG_CONFIG_HOME:-${HOME}/.config}/jaynet-build-tools.env"
+if [[ -z "${BIN_DIR:-}" && -f "$_BIN_STATE" ]]; then
+    source "$_BIN_STATE"   # sets BIN_DIR
+fi
 BIN_DIR="${BIN_DIR:-}"
 if [[ -z "$BIN_DIR" ]]; then
     if [[ -t 0 ]]; then
@@ -171,6 +180,8 @@ fi
 BIN_DIR="${BIN_DIR/#\~/${HOME}}"
 BIN_DIR="${BIN_DIR%/}"
 mkdir -p "$BIN_DIR"
+mkdir -p "$(dirname "$_BIN_STATE")"
+printf 'BIN_DIR=%q\n' "$BIN_DIR" > "$_BIN_STATE"
 
 # Copy built binaries into $BIN_DIR. Args: <build/bin dir> <binary>...
 # NOTE: stub-copy only — the copied binaries keep their RUNPATH into the
