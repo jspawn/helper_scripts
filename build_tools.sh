@@ -1428,10 +1428,10 @@ main() {
     echo
     for job in "${JOBS_LIST[@]}"; do
         case "$job" in
-            llama-rocm)     echo -e "  llama   ROCm:   ${ROCM_DIR}/build/bin/llama-server" ;;
-            llama-vulkan)   echo -e "  llama   Vulkan: ${VULKAN_DIR}/build/bin/llama-server" ;;
-            llama-cuda)     echo -e "  llama   CUDA:   ${CUDA_DIR}/build/bin/llama-server" ;;
-            llama-sycl)     echo -e "  llama   SYCL:   ${SYCL_DIR}/build/bin/llama-server" ;;
+            llama-rocm)     echo -e "  llama   ROCm:   ${BIN_DIR}/llama.cpp.rocm/bin/llama-server" ;;
+            llama-vulkan)   echo -e "  llama   Vulkan: ${BIN_DIR}/llama.cpp.vulkan/bin/llama-server" ;;
+            llama-cuda)     echo -e "  llama   CUDA:   ${BIN_DIR}/llama.cpp.cuda/bin/llama-server" ;;
+            llama-sycl)     echo -e "  llama   SYCL:   ${BIN_DIR}/llama.cpp.sycl/bin/llama-server" ;;
             sd-rocm)        echo -e "  sd      ROCm:   ${SD_ROCM_DIR}/build/bin/{sd-cli,sd-server}" ;;
             sd-vulkan)      echo -e "  sd      Vulkan: ${SD_VULKAN_DIR}/build/bin/{sd-cli,sd-server}" ;;
             sd-cuda)        echo -e "  sd      CUDA:   ${SD_CUDA_DIR}/build/bin/{sd-cli,sd-server}" ;;
@@ -1440,7 +1440,7 @@ main() {
             whisper-vulkan) echo -e "  whisper Vulkan: ${BIN_DIR}/whisper.cpp.vulkan/bin/whisper-server" ;;
             whisper-cuda)   echo -e "  whisper CUDA:   ${BIN_DIR}/whisper.cpp.cuda/bin/whisper-server" ;;
             whisper-sycl)   echo -e "  whisper SYCL:   ${BIN_DIR}/whisper.cpp.sycl/bin/whisper-server" ;;
-            llama-cpu)      echo -e "  llama   CPU:    ${CPU_DIR}/build/bin/llama-server" ;;
+            llama-cpu)      echo -e "  llama   CPU:    ${BIN_DIR}/llama.cpp.cpu/bin/llama-server" ;;
             k2horizon-rocm)   echo -e "  k2horizon ROCm:   ${BIN_DIR}/llama.cpp-k2horizon.rocm/bin/llama-server" ;;
             k2horizon-vulkan) echo -e "  k2horizon Vulkan: ${BIN_DIR}/llama.cpp-k2horizon.vulkan/bin/llama-server" ;;
             k2horizon-cuda)   echo -e "  k2horizon CUDA:   ${BIN_DIR}/llama.cpp-k2horizon.cuda/bin/llama-server" ;;
@@ -1464,7 +1464,7 @@ main() {
     # main() — and the whole script — exit 1 after a successful build
     echo -e "${DIM}Quick tests:${NC}"
     if [[ " ${JOBS_LIST[*]} " == *" llama-rocm "* ]]; then
-        echo -e "  ${ROCM_DIR}/build/bin/llama-server --list-devices"
+        echo -e "  ${BIN_DIR}/llama.cpp.rocm/bin/llama-server --list-devices"
     fi
     if [[ " ${JOBS_LIST[*]} " == *" sd-rocm "* ]]; then
         echo -e "  ${SD_ROCM_DIR}/build/bin/sd-cli --help | head -30"
