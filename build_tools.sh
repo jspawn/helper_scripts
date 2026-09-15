@@ -155,6 +155,13 @@ ok()   { echo -e "${GREEN}OK${NC} $*"; }
 warn() { echo -e "${YELLOW}!${NC}  $*"; }
 fail() { echo -e "${RED}FAIL${NC} $*"; exit 1; }
 
+# Binaries must also work after the source/build tree is deleted: CMake puts
+# the build/bin dir into RUNPATH, which dies with the tree. Adding $ORIGIN
+# variants makes build-tree AND installed-prefix layouts (bin + sibling lib)
+# self-contained. CMake appends its own entries after these, so build-tree
+# execution keeps working too.
+ORIGIN_RPATH=(-DCMAKE_BUILD_RPATH='\$ORIGIN;\$ORIGIN/../lib')
+
 # -- Install dir --------------------------------------------------------------
 # Ask where to install the built binaries. Default: the dir you used last
 # time (persisted in $_BIN_STATE), else ~/jaynet-bin. BIN_DIR env overrides
@@ -499,6 +506,7 @@ build_llama_rocm() {
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_WEBUI=OFF \
         -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
         -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
         -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
         -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
@@ -535,6 +543,7 @@ build_llama_vulkan() {
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_WEBUI=OFF \
         -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
         -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
         -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
@@ -587,6 +596,7 @@ build_llama_cuda() {
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_WEBUI=OFF \
         -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
         -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
         -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
@@ -624,6 +634,7 @@ build_llama_sycl() {
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_WEBUI=OFF \
         -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
         -DCMAKE_C_COMPILER=icx \
         -DCMAKE_CXX_COMPILER=icpx
 
@@ -658,6 +669,7 @@ build_whisper_rocm() {
         -DGGML_HIP=ON \
         -DAMDGPU_TARGETS="$AMDGPU_TARGETS" \
         -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
         -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
         -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
         -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
@@ -690,6 +702,7 @@ build_whisper_vulkan() {
     cmake -B build \
         -DGGML_VULKAN=ON \
         -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
         -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
         -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
@@ -722,6 +735,7 @@ build_whisper_cuda() {
         -DGGML_CUDA=ON \
         -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
         -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
         -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
         -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
@@ -754,6 +768,7 @@ build_whisper_sycl() {
     cmake -B build \
         -DGGML_SYCL=ON \
         -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
         -DCMAKE_C_COMPILER=icx \
         -DCMAKE_CXX_COMPILER=icpx
 
@@ -864,6 +879,7 @@ build_sd_rocm() {
         -DGPU_TARGETS="$AMDGPU_TARGETS" \
         -DAMDGPU_TARGETS="$AMDGPU_TARGETS" \
         -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
         -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
         -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
         -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
@@ -902,6 +918,7 @@ build_sd_vulkan() {
     cmake -B build \
         -DSD_VULKAN=ON \
         -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
         -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
         -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
@@ -938,6 +955,7 @@ build_sd_cuda() {
         -DSD_CUDA=ON \
         -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
         -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
         -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
         -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
@@ -972,6 +990,7 @@ build_sd_sycl() {
     cmake -B build \
         -DSD_SYCL=ON \
         -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
         -DCMAKE_C_COMPILER=icx \
         -DCMAKE_CXX_COMPILER=icpx
 
@@ -1011,6 +1030,7 @@ build_llama_cpu() {
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_WEBUI=OFF \
         -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
         -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
         -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
@@ -1039,6 +1059,7 @@ build_whisper_cpu() {
     step "Configure whisper.cpp CPU (-march=$MARCH)"
     cmake -B build \
         -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
         -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
         -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
@@ -1068,6 +1089,7 @@ build_sd_cpu() {
     step "Configure stable-diffusion.cpp CPU (-march=$MARCH)"
     cmake -B build \
         -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
         -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
         -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
@@ -1164,6 +1186,7 @@ build_k2horizon_rocm() {
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_WEBUI=OFF \
         -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
         -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
         -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
         -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
@@ -1196,6 +1219,7 @@ build_k2horizon_vulkan() {
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_WEBUI=OFF \
         -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
         -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
         -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
@@ -1227,6 +1251,7 @@ build_k2horizon_cuda() {
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_WEBUI=OFF \
         -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
         -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
         -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
@@ -1256,6 +1281,7 @@ build_k2horizon_cpu() {
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_WEBUI=OFF \
         -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
         -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
         -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
 
