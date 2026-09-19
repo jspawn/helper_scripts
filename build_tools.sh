@@ -18,14 +18,15 @@
 #    ./build_tools.sh tools              # llm-tools venv (hf download tooling)
 #    ./build_tools.sh --clean llama cuda # nuke build dir first, then build
 #    ./build_tools.sh k2horizon rocm     # patched K2-Horizon llama.cpp fork
+#    ./build_tools.sh spark rocm         # Spark-X2.5 llama.cpp fork (spark2_5 arch)
 #    ./build_tools.sh update             # rebuild everything already built
 #                                         # (every source tree/venv present —
 #                                         #  syncs to latest, k2horizon keeps
 #                                         #  its pin; add --clean to rebuild
 #                                         #  from scratch)
 #
-#  Projects:  llama, sd, whisper, piper, tools, k2horizon, all
-#             (k2horizon is NOT part of "all" -- experimental patched fork)
+#  Projects:  llama, sd, whisper, piper, tools, k2horizon, spark, all
+#             (k2horizon/spark are NOT part of "all" -- experimental forks)
 #  Special:   update -- rebuild every tree/venv already present (see above)
 #  Backends:  rocm, vulkan, cuda, sycl, cpu
 #             (omitted: menu; non-interactive: vulkan)
@@ -83,6 +84,13 @@ K2_ROCM_DIR="${BASE_DIR}/llama.cpp-k2horizon-rocm"
 K2_VULKAN_DIR="${BASE_DIR}/llama.cpp-k2horizon-vulkan"
 K2_CUDA_DIR="${BASE_DIR}/llama.cpp-k2horizon-cuda"
 K2_CPU_DIR="${BASE_DIR}/llama.cpp-k2horizon-cpu"
+# Spark-X2.5 fork: mainline llama.cpp has no spark2_5 arch (hybrid sliding-
+# window attention) — the model card (XHToken/Spark-X2.5-4B) points at the
+# author's fork. No pin, no patches: the fork IS the reference tree, so
+# sync_repo tracks its latest like any other project.
+SPARK_REPO="https://github.com/XHToken/llama.cpp"
+SPARK_ROCM_DIR="${BASE_DIR}/llama.cpp-spark-rocm"
+SPARK_CPU_DIR="${BASE_DIR}/llama.cpp-spark-cpu"
 # GPU/CPU tuning knobs. Empty here = asked later, but only when the matching
 # backend is actually in the build plan; env presets skip the prompts.
 #   AMDGPU_TARGETS: gfx target for ROCm builds (e.g. gfx1100, gfx1201)
@@ -130,7 +138,7 @@ CLEAN=0
 UPDATE=0
 for arg in "$@"; do
     case "$arg" in
-        llama|sd|whisper|piper|tools|k2horizon) PROJECTS+=("$arg") ;;
+        llama|sd|whisper|piper|tools|k2horizon|spark) PROJECTS+=("$arg") ;;
         all) PROJECTS+=(llama sd whisper piper tools) ;;
         rocm|vulkan|cuda|sycl|cpu) BACKENDS+=("$arg") ;;
         update) UPDATE=1 ;;
@@ -271,6 +279,7 @@ if [[ $UPDATE -eq 1 ]]; then
         "$WHISPER_CPU_DIR:whisper-cpu" \
         "$K2_ROCM_DIR:k2horizon-rocm"    "$K2_VULKAN_DIR:k2horizon-vulkan" \
         "$K2_CUDA_DIR:k2horizon-cuda"    "$K2_CPU_DIR:k2horizon-cpu" \
+        "$SPARK_ROCM_DIR:spark-rocm"     "$SPARK_CPU_DIR:spark-cpu" \
     ; do
         [[ -d "${pair%%:*}/.git" ]] && JOBS_LIST+=("${pair##*:}")
     done
@@ -1295,6 +1304,87 @@ build_k2horizon_cpu() {
     install_prefix "$K2_CPU_DIR" llama.cpp-k2horizon cpu llama-server
 }
 
+# -- Spark-X2.5 fork helpers ----------------------------------------------------
+# Clone if missing, then track latest (no pin — unlike the K2 fork there are
+# no patches to keep applying, and the fork moves with the model releases).
+sync_spark_repo() {
+    local dir="$1"
+    if [[ ! -d "$dir/.git" ]]; then
+        warn "$dir not found, cloning Spark-X2.5 fork..."
+        git clone "$SPARK_REPO" "$dir"
+    fi
+    sync_repo "$dir"
+}
+
+build_spark_rocm() {
+    sync_spark_repo "$SPARK_ROCM_DIR"
+    cd "$SPARK_ROCM_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean Spark ROCm build dir"
+        rm -rf build
+    fi
+
+    local rocwmma_flag="OFF"
+    if [[ -f "/opt/rocm/include/rocwmma/rocwmma-version.hpp" ]] \
+       || [[ -f "/usr/include/rocwmma/rocwmma-version.hpp" ]]; then
+        rocwmma_flag="ON"
+    fi
+
+    step "Configure Spark-X2.5 ROCm (${AMDGPU_TARGETS})"
+    cmake -B build \
+        -DGGML_HIP=ON \
+        -DAMDGPU_TARGETS="$AMDGPU_TARGETS" \
+        -DGGML_HIP_ROCWMMA_FATTN="$rocwmma_flag" \
+        -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_WEBUI=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
+        -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
+        -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
+
+    step "Build Spark-X2.5 ROCm (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" --target llama-server llama-cli llama-bench
+
+    [[ -x "$SPARK_ROCM_DIR/build/bin/llama-server" ]] \
+        || fail "Spark ROCm build produced no llama-server binary"
+    ok "Spark ROCm build at $SPARK_ROCM_DIR/build/bin/llama-server"
+
+    install_prefix "$SPARK_ROCM_DIR" llama.cpp-spark rocm llama-server
+}
+
+build_spark_cpu() {
+    sync_spark_repo "$SPARK_CPU_DIR"
+    cd "$SPARK_CPU_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean Spark CPU build dir"
+        rm -rf build
+    fi
+
+    step "Configure Spark-X2.5 CPU (-march=$MARCH)"
+    cmake -B build \
+        -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_WEBUI=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
+
+    step "Build Spark-X2.5 CPU (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" --target llama-server llama-cli llama-bench
+
+    [[ -x "$SPARK_CPU_DIR/build/bin/llama-server" ]] \
+        || fail "Spark CPU build produced no llama-server binary"
+    ok "Spark CPU build at $SPARK_CPU_DIR/build/bin/llama-server"
+
+    install_prefix "$SPARK_CPU_DIR" llama.cpp-spark cpu llama-server
+}
+
 # -- Sanity: toolchain ------------------------------------------------------
 preflight() {
     step "Pre-flight checks"
@@ -1451,6 +1541,8 @@ main() {
             k2horizon-vulkan) build_k2horizon_vulkan ;;
             k2horizon-cuda)   build_k2horizon_cuda ;;
             k2horizon-cpu)    build_k2horizon_cpu ;;
+            spark-rocm)       build_spark_rocm ;;
+            spark-cpu)        build_spark_cpu ;;
             sd-cpu)         build_sd_cpu ;;
             whisper-cpu)    build_whisper_cpu ;;
             piper)          build_piper ;;
