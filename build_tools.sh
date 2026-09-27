@@ -19,14 +19,16 @@
 #    ./build_tools.sh --clean llama cuda # nuke build dir first, then build
 #    ./build_tools.sh k2horizon rocm     # patched K2-Horizon llama.cpp fork
 #    ./build_tools.sh spark rocm         # Spark-X2.5 llama.cpp fork (spark2_5 arch)
+#    ./build_tools.sh bonsai rocm        # PrismML llama.cpp fork, prism branch
+#                                         # (ternary PQ2_0/PTQ1_0 + Hadamard runtime)
 #    ./build_tools.sh update             # rebuild everything already built
 #                                         # (every source tree/venv present —
 #                                         #  syncs to latest, k2horizon keeps
 #                                         #  its pin; add --clean to rebuild
 #                                         #  from scratch)
 #
-#  Projects:  llama, sd, whisper, piper, tools, k2horizon, spark, all
-#             (k2horizon/spark are NOT part of "all" -- experimental forks)
+#  Projects:  llama, sd, whisper, piper, tools, k2horizon, spark, bonsai, all
+#             (k2horizon/spark/bonsai are NOT part of "all" -- experimental forks)
 #  Special:   update -- rebuild every tree/venv already present (see above)
 #  Backends:  rocm, vulkan, cuda, sycl, cpu
 #             (omitted: menu; non-interactive: vulkan)
@@ -91,6 +93,15 @@ K2_CPU_DIR="${BASE_DIR}/llama.cpp-k2horizon-cpu"
 SPARK_REPO="https://github.com/XHToken/llama.cpp"
 SPARK_ROCM_DIR="${BASE_DIR}/llama.cpp-spark-rocm"
 SPARK_CPU_DIR="${BASE_DIR}/llama.cpp-spark-cpu"
+# PrismML fork (prism branch): Ternary-Bonsai models need the custom ternary
+# kernels + Hadamard activation runtime — stock llama.cpp rejects PQ2_0 /
+# PTQ1_0 (model card: prism-ml/Ternary-Bonsai-2-27B-gguf). ROCm works (RDNA3
+# confirmed upstream). No pin, no patches: the prism branch IS the reference
+# tree, synced like any other project.
+BONSAI_REPO="https://github.com/PrismML-Eng/llama.cpp"
+BONSAI_BRANCH="prism"
+BONSAI_ROCM_DIR="${BASE_DIR}/llama.cpp-bonsai-rocm"
+BONSAI_CPU_DIR="${BASE_DIR}/llama.cpp-bonsai-cpu"
 # GPU/CPU tuning knobs. Empty here = asked later, but only when the matching
 # backend is actually in the build plan; env presets skip the prompts.
 #   AMDGPU_TARGETS: gfx target for ROCm builds (e.g. gfx1100, gfx1201)
@@ -138,7 +149,7 @@ CLEAN=0
 UPDATE=0
 for arg in "$@"; do
     case "$arg" in
-        llama|sd|whisper|piper|tools|k2horizon|spark) PROJECTS+=("$arg") ;;
+        llama|sd|whisper|piper|tools|k2horizon|spark|bonsai) PROJECTS+=("$arg") ;;
         all) PROJECTS+=(llama sd whisper piper tools) ;;
         rocm|vulkan|cuda|sycl|cpu) BACKENDS+=("$arg") ;;
         update) UPDATE=1 ;;
@@ -280,6 +291,7 @@ if [[ $UPDATE -eq 1 ]]; then
         "$K2_ROCM_DIR:k2horizon-rocm"    "$K2_VULKAN_DIR:k2horizon-vulkan" \
         "$K2_CUDA_DIR:k2horizon-cuda"    "$K2_CPU_DIR:k2horizon-cpu" \
         "$SPARK_ROCM_DIR:spark-rocm"     "$SPARK_CPU_DIR:spark-cpu" \
+        "$BONSAI_ROCM_DIR:bonsai-rocm"   "$BONSAI_CPU_DIR:bonsai-cpu" \
     ; do
         [[ -d "${pair%%:*}/.git" ]] && JOBS_LIST+=("${pair##*:}")
     done
@@ -1385,6 +1397,94 @@ build_spark_cpu() {
     install_prefix "$SPARK_CPU_DIR" llama.cpp-spark cpu llama-server
 }
 
+# -- llama.cpp PrismML/Bonsai fork builds (prism branch; rocm/cpu) -----------
+# Clone (if missing) pinned to the prism BRANCH — the fork's default branch
+# tracks upstream llama.cpp, the ternary kernels live on prism. sync_repo
+# then fast-forwards that branch like any other tree.
+sync_bonsai_repo() {
+    local dir="$1"
+    if [[ ! -d "$dir/.git" ]]; then
+        warn "$dir not found, cloning PrismML fork ($BONSAI_BRANCH branch)..."
+        git clone -b "$BONSAI_BRANCH" "$BONSAI_REPO" "$dir"
+    fi
+    cd "$dir"
+    if [[ "$(git rev-parse --abbrev-ref HEAD)" != "$BONSAI_BRANCH" ]]; then
+        git diff --quiet && git diff --cached --quiet \
+            || fail "$dir not on $BONSAI_BRANCH with local changes — resolve manually"
+        git checkout --quiet "$BONSAI_BRANCH"
+    fi
+    sync_repo "$dir"
+}
+
+build_bonsai_rocm() {
+    sync_bonsai_repo "$BONSAI_ROCM_DIR"
+    cd "$BONSAI_ROCM_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean Bonsai ROCm build dir"
+        rm -rf build
+    fi
+
+    local rocwmma_flag="OFF"
+    if [[ -f "/opt/rocm/include/rocwmma/rocwmma-version.hpp" ]] \
+       || [[ -f "/usr/include/rocwmma/rocwmma-version.hpp" ]]; then
+        rocwmma_flag="ON"
+    fi
+
+    step "Configure Bonsai/PrismML ROCm (${AMDGPU_TARGETS})"
+    cmake -B build \
+        -DGGML_HIP=ON \
+        -DAMDGPU_TARGETS="$AMDGPU_TARGETS" \
+        -DGGML_HIP_ROCWMMA_FATTN="$rocwmma_flag" \
+        -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_WEBUI=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
+        -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
+        -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
+
+    step "Build Bonsai/PrismML ROCm (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" --target llama-server llama-cli llama-bench
+
+    [[ -x "$BONSAI_ROCM_DIR/build/bin/llama-server" ]] \
+        || fail "Bonsai ROCm build produced no llama-server binary"
+    ok "Bonsai ROCm build at $BONSAI_ROCM_DIR/build/bin/llama-server"
+
+    install_prefix "$BONSAI_ROCM_DIR" llama.cpp-bonsai rocm llama-server
+}
+
+build_bonsai_cpu() {
+    sync_bonsai_repo "$BONSAI_CPU_DIR"
+    cd "$BONSAI_CPU_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean Bonsai CPU build dir"
+        rm -rf build
+    fi
+
+    step "Configure Bonsai/PrismML CPU (-march=$MARCH)"
+    cmake -B build \
+        -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_WEBUI=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
+
+    step "Build Bonsai/PrismML CPU (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" --target llama-server llama-cli llama-bench
+
+    [[ -x "$BONSAI_CPU_DIR/build/bin/llama-server" ]] \
+        || fail "Bonsai CPU build produced no llama-server binary"
+    ok "Bonsai CPU build at $BONSAI_CPU_DIR/build/bin/llama-server"
+
+    install_prefix "$BONSAI_CPU_DIR" llama.cpp-bonsai cpu llama-server
+}
+
 # -- Sanity: toolchain ------------------------------------------------------
 preflight() {
     step "Pre-flight checks"
@@ -1543,6 +1643,8 @@ main() {
             k2horizon-cpu)    build_k2horizon_cpu ;;
             spark-rocm)       build_spark_rocm ;;
             spark-cpu)        build_spark_cpu ;;
+            bonsai-rocm)      build_bonsai_rocm ;;
+            bonsai-cpu)       build_bonsai_cpu ;;
             sd-cpu)         build_sd_cpu ;;
             whisper-cpu)    build_whisper_cpu ;;
             piper)          build_piper ;;
@@ -1574,6 +1676,8 @@ main() {
             k2horizon-vulkan) echo -e "  k2horizon Vulkan: ${BIN_DIR}/llama.cpp-k2horizon.vulkan/bin/llama-server" ;;
             k2horizon-cuda)   echo -e "  k2horizon CUDA:   ${BIN_DIR}/llama.cpp-k2horizon.cuda/bin/llama-server" ;;
             k2horizon-cpu)    echo -e "  k2horizon CPU:    ${BIN_DIR}/llama.cpp-k2horizon.cpu/bin/llama-server" ;;
+            bonsai-rocm)      echo -e "  bonsai  ROCm:   ${BIN_DIR}/llama.cpp-bonsai.rocm/bin/llama-server" ;;
+            bonsai-cpu)       echo -e "  bonsai  CPU:    ${BIN_DIR}/llama.cpp-bonsai.cpu/bin/llama-server" ;;
             sd-cpu)         echo -e "  sd      CPU:    ${SD_CPU_DIR}/build/bin/{sd-cli,sd-server}" ;;
             whisper-cpu)    echo -e "  whisper CPU:    ${BIN_DIR}/whisper.cpp.cpu/bin/whisper-server" ;;
             piper)          echo -e "  piper   TTS:    ${PIPER_VENV}/bin/piper (voice: ${PIPER_VOICE_DIR}/${PIPER_VOICE}.onnx)" ;;
