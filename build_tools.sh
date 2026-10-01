@@ -1,7 +1,8 @@
 #!/bin/bash
 # ============================================================================
 #  build_tools.sh -- Build llama.cpp, stable-diffusion.cpp, whisper.cpp,
-#                     piper TTS, and the llm-tools venv
+#                     piper TTS, omnivoice.cpp (OmniVoice TTS), and the
+#                     llm-tools venv
 #  Backends:  vulkan (default; AMD/NVIDIA/Intel/mixed, no vendor SDK),
 #             rocm (AMD), cuda (NVIDIA), sycl (Intel oneAPI),
 #             cpu (no GPU; AVX2/AVX512/AMX via -march=native)
@@ -21,14 +22,18 @@
 #    ./build_tools.sh spark rocm         # Spark-X2.5 llama.cpp fork (spark2_5 arch)
 #    ./build_tools.sh bonsai rocm        # PrismML llama.cpp fork, prism branch
 #                                         # (ternary PQ2_0/PTQ1_0 + Hadamard runtime)
+#    ./build_tools.sh omnivoice rocm     # OmniVoice TTS (omnivoice.cpp port:
+#                                         #  tts-server, omnivoice-tts, omnivoice-codec)
 #    ./build_tools.sh update             # rebuild everything already built
 #                                         # (every source tree/venv present —
 #                                         #  syncs to latest, k2horizon keeps
 #                                         #  its pin; add --clean to rebuild
 #                                         #  from scratch)
 #
-#  Projects:  llama, sd, whisper, piper, tools, k2horizon, spark, bonsai, all
-#             (k2horizon/spark/bonsai are NOT part of "all" -- experimental forks)
+#  Projects:  llama, sd, whisper, piper, tools, k2horizon, spark, bonsai,
+#             omnivoice, all
+#             (k2horizon/spark/bonsai/omnivoice are NOT part of "all" --
+#             experimental forks / opt-in tools)
 #  Special:   update -- rebuild every tree/venv already present (see above)
 #  Backends:  rocm, vulkan, cuda, sycl, cpu
 #             (omitted: menu; non-interactive: vulkan)
@@ -102,6 +107,18 @@ BONSAI_REPO="https://github.com/PrismML-Eng/llama.cpp"
 BONSAI_BRANCH="prism"
 BONSAI_ROCM_DIR="${BASE_DIR}/llama.cpp-bonsai-rocm"
 BONSAI_CPU_DIR="${BASE_DIR}/llama.cpp-bonsai-cpu"
+# OmniVoice TTS (omnivoice.cpp): GGML port of k2-fsa/OmniVoice — massively
+# multilingual zero-shot TTS with voice cloning + voice design. Ships
+# tts-server (OpenAI-compatible HTTP with a cloned-voice registry),
+# omnivoice-tts and omnivoice-codec. ggml is a submodule (recursive clone);
+# GGML_HIP/GGML_VULKAN/GGML_CUDA pass straight through to it (whisper-style),
+# so no upstream ROCm build script is needed. Binaries land in build/ ROOT,
+# not build/bin — install_omni_prefix handles that. NOT part of "all".
+OMNI_REPO="https://github.com/ServeurpersoCom/omnivoice.cpp"
+OMNI_ROCM_DIR="${BASE_DIR}/omnivoice.cpp-rocm"
+OMNI_VULKAN_DIR="${BASE_DIR}/omnivoice.cpp-vulkan"
+OMNI_CUDA_DIR="${BASE_DIR}/omnivoice.cpp-cuda"
+OMNI_CPU_DIR="${BASE_DIR}/omnivoice.cpp-cpu"
 # GPU/CPU tuning knobs. Empty here = asked later, but only when the matching
 # backend is actually in the build plan; env presets skip the prompts.
 #   AMDGPU_TARGETS: gfx target for ROCm builds (e.g. gfx1100, gfx1201)
@@ -149,7 +166,7 @@ CLEAN=0
 UPDATE=0
 for arg in "$@"; do
     case "$arg" in
-        llama|sd|whisper|piper|tools|k2horizon|spark|bonsai) PROJECTS+=("$arg") ;;
+        llama|sd|whisper|piper|tools|k2horizon|spark|bonsai|omnivoice) PROJECTS+=("$arg") ;;
         all) PROJECTS+=(llama sd whisper piper tools) ;;
         rocm|vulkan|cuda|sycl|cpu) BACKENDS+=("$arg") ;;
         update) UPDATE=1 ;;
@@ -292,6 +309,8 @@ if [[ $UPDATE -eq 1 ]]; then
         "$K2_CUDA_DIR:k2horizon-cuda"    "$K2_CPU_DIR:k2horizon-cpu" \
         "$SPARK_ROCM_DIR:spark-rocm"     "$SPARK_CPU_DIR:spark-cpu" \
         "$BONSAI_ROCM_DIR:bonsai-rocm"   "$BONSAI_CPU_DIR:bonsai-cpu" \
+        "$OMNI_ROCM_DIR:omnivoice-rocm"   "$OMNI_VULKAN_DIR:omnivoice-vulkan" \
+        "$OMNI_CUDA_DIR:omnivoice-cuda"   "$OMNI_CPU_DIR:omnivoice-cpu" \
     ; do
         [[ -d "${pair%%:*}/.git" ]] && JOBS_LIST+=("${pair##*:}")
     done
@@ -1485,6 +1504,145 @@ build_bonsai_cpu() {
     install_prefix "$BONSAI_CPU_DIR" llama.cpp-bonsai cpu llama-server
 }
 
+# -- omnivoice.cpp (OmniVoice TTS) ------------------------------------------
+# Binaries AND shared libs land in build/ ROOT (CMake sets the output dirs to
+# CMAKE_BINARY_DIR), so install_prefix doesn't apply — same versioned-prefix
+# pattern by hand. Args: <source tree> <backend>
+install_omni_prefix() {
+    local src_dir="$1" backend="$2"
+    local tag dest link f
+    tag="$(git -C "$src_dir" describe --tags --always 2>/dev/null || echo unknown)"
+    dest="$BIN_DIR/omnivoice.cpp.${backend}-${tag}"
+    link="$BIN_DIR/omnivoice.cpp.${backend}"
+    step "Install omnivoice (${backend}) -> ${dest}"
+    rm -rf "$dest"
+    mkdir -p "$dest/bin" "$dest/lib"
+    for f in "$src_dir"/build/*.so*; do
+        [[ -e "$f" ]] && cp -a "$f" "$dest/lib/"
+    done
+    for f in omnivoice-tts omnivoice-codec tts-server; do
+        [[ -x "$src_dir/build/$f" ]] || fail "omnivoice build produced no $f"
+        cp "$src_dir/build/$f" "$dest/bin/$f"
+    done
+    ln -sfn "$dest" "$link"
+    ok "Installed omnivoice ${backend}: $link/bin/tts-server"
+}
+
+build_omnivoice_rocm() {
+    check_clone "$OMNI_ROCM_DIR" "$OMNI_REPO" recursive
+    sync_repo "$OMNI_ROCM_DIR" recursive
+    cd "$OMNI_ROCM_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean omnivoice ROCm build dir"
+        rm -rf build
+    fi
+
+    step "Configure omnivoice.cpp ROCm (${AMDGPU_TARGETS})"
+    cmake -B build \
+        -DGGML_HIP=ON \
+        -DAMDGPU_TARGETS="$AMDGPU_TARGETS" \
+        -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
+        -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
+        -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
+
+    step "Build omnivoice ROCm (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" \
+        --target tts-server omnivoice-tts omnivoice-codec
+
+    [[ -x "$OMNI_ROCM_DIR/build/tts-server" ]] \
+        || fail "omnivoice ROCm build produced no tts-server binary"
+
+    install_omni_prefix "$OMNI_ROCM_DIR" rocm
+}
+
+build_omnivoice_vulkan() {
+    check_clone "$OMNI_VULKAN_DIR" "$OMNI_REPO" recursive
+    sync_repo "$OMNI_VULKAN_DIR" recursive
+    cd "$OMNI_VULKAN_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean omnivoice Vulkan build dir"
+        rm -rf build
+    fi
+
+    step "Configure omnivoice.cpp Vulkan"
+    cmake -B build \
+        -DGGML_VULKAN=ON \
+        -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
+
+    step "Build omnivoice Vulkan (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" \
+        --target tts-server omnivoice-tts omnivoice-codec
+
+    [[ -x "$OMNI_VULKAN_DIR/build/tts-server" ]] \
+        || fail "omnivoice Vulkan build produced no tts-server binary"
+
+    install_omni_prefix "$OMNI_VULKAN_DIR" vulkan
+}
+
+build_omnivoice_cuda() {
+    check_clone "$OMNI_CUDA_DIR" "$OMNI_REPO" recursive
+    sync_repo "$OMNI_CUDA_DIR" recursive
+    cd "$OMNI_CUDA_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean omnivoice CUDA build dir"
+        rm -rf build
+    fi
+
+    step "Configure omnivoice.cpp CUDA (${CUDA_ARCHS})"
+    cmake -B build \
+        -DGGML_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
+        -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
+
+    step "Build omnivoice CUDA (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" \
+        --target tts-server omnivoice-tts omnivoice-codec
+
+    [[ -x "$OMNI_CUDA_DIR/build/tts-server" ]] \
+        || fail "omnivoice CUDA build produced no tts-server binary"
+
+    install_omni_prefix "$OMNI_CUDA_DIR" cuda
+}
+
+build_omnivoice_cpu() {
+    check_clone "$OMNI_CPU_DIR" "$OMNI_REPO" recursive
+    sync_repo "$OMNI_CPU_DIR" recursive
+    cd "$OMNI_CPU_DIR"
+
+    if [[ $CLEAN -eq 1 ]]; then
+        step "Clean omnivoice CPU build dir"
+        rm -rf build
+    fi
+
+    step "Configure omnivoice.cpp CPU (-march=$MARCH)"
+    cmake -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        "${ORIGIN_RPATH[@]}" \
+        -DCMAKE_C_FLAGS="-march=$MARCH -O3" \
+        -DCMAKE_CXX_FLAGS="-march=$MARCH -O3"
+
+    step "Build omnivoice CPU (-j${JOBS})"
+    cmake --build build --config Release -j"$JOBS" \
+        --target tts-server omnivoice-tts omnivoice-codec
+
+    [[ -x "$OMNI_CPU_DIR/build/tts-server" ]] \
+        || fail "omnivoice CPU build produced no tts-server binary"
+
+    install_omni_prefix "$OMNI_CPU_DIR" cpu
+}
+
 # -- Sanity: toolchain ------------------------------------------------------
 preflight() {
     step "Pre-flight checks"
@@ -1645,6 +1803,10 @@ main() {
             spark-cpu)        build_spark_cpu ;;
             bonsai-rocm)      build_bonsai_rocm ;;
             bonsai-cpu)       build_bonsai_cpu ;;
+            omnivoice-rocm)   build_omnivoice_rocm ;;
+            omnivoice-vulkan) build_omnivoice_vulkan ;;
+            omnivoice-cuda)   build_omnivoice_cuda ;;
+            omnivoice-cpu)    build_omnivoice_cpu ;;
             sd-cpu)         build_sd_cpu ;;
             whisper-cpu)    build_whisper_cpu ;;
             piper)          build_piper ;;
@@ -1678,6 +1840,10 @@ main() {
             k2horizon-cpu)    echo -e "  k2horizon CPU:    ${BIN_DIR}/llama.cpp-k2horizon.cpu/bin/llama-server" ;;
             bonsai-rocm)      echo -e "  bonsai  ROCm:   ${BIN_DIR}/llama.cpp-bonsai.rocm/bin/llama-server" ;;
             bonsai-cpu)       echo -e "  bonsai  CPU:    ${BIN_DIR}/llama.cpp-bonsai.cpu/bin/llama-server" ;;
+            omnivoice-rocm)   echo -e "  omnivoice ROCm:   ${BIN_DIR}/omnivoice.cpp.rocm/bin/tts-server" ;;
+            omnivoice-vulkan) echo -e "  omnivoice Vulkan: ${BIN_DIR}/omnivoice.cpp.vulkan/bin/tts-server" ;;
+            omnivoice-cuda)   echo -e "  omnivoice CUDA:   ${BIN_DIR}/omnivoice.cpp.cuda/bin/tts-server" ;;
+            omnivoice-cpu)    echo -e "  omnivoice CPU:    ${BIN_DIR}/omnivoice.cpp.cpu/bin/tts-server" ;;
             sd-cpu)         echo -e "  sd      CPU:    ${SD_CPU_DIR}/build/bin/{sd-cli,sd-server}" ;;
             whisper-cpu)    echo -e "  whisper CPU:    ${BIN_DIR}/whisper.cpp.cpu/bin/whisper-server" ;;
             piper)          echo -e "  piper   TTS:    ${PIPER_VENV}/bin/piper (voice: ${PIPER_VOICE_DIR}/${PIPER_VOICE}.onnx)" ;;
@@ -1704,6 +1870,9 @@ main() {
     fi
     if [[ " ${JOBS_LIST[*]} " == *" whisper-rocm "* ]]; then
         echo -e "  ${BIN_DIR}/whisper.cpp.rocm/bin/whisper-server -m ~/jaynet-models/whisper/ggml-small.bin --port 8097"
+    fi
+    if [[ " ${JOBS_LIST[*]} " == *" omnivoice-rocm "* ]]; then
+        echo -e "  echo 'hello world' | ${BIN_DIR}/omnivoice.cpp.rocm/bin/omnivoice-tts --model <omnivoice-base-Q8_0.gguf> --codec <omnivoice-tokenizer-F32.gguf> --lang English -o /tmp/ov.wav"
     fi
     if [[ " ${JOBS_LIST[*]} " == *" piper "* ]]; then
         echo -e "  echo 'hello world' | ${PIPER_VENV}/bin/piper --model ${PIPER_VOICE_DIR}/${PIPER_VOICE}.onnx --output_file /tmp/piper-test.wav"
