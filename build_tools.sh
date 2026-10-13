@@ -29,6 +29,14 @@
 #                                         #  syncs to latest, k2horizon keeps
 #                                         #  its pin; add --clean to rebuild
 #                                         #  from scratch)
+#    ./build_tools.sh delete             # interactive picker: remove builds
+#                                         #  (source tree + installed prefixes —
+#                                         #   deleting the TREE is what stops
+#                                         #   `update` from rebuilding it)
+#    ./build_tools.sh delete llama rocm  # remove one build directly
+#    ./build_tools.sh delete --stale     # prune old versioned prefixes only
+#                                         #  (keeps each current symlink target)
+#    -y/--yes: skip the delete confirmation prompt
 #
 #  Projects:  llama, sd, whisper, piper, tools, k2horizon, spark, bonsai,
 #             omnivoice, all
@@ -164,13 +172,19 @@ PROJECTS=()
 BACKENDS=()
 CLEAN=0
 UPDATE=0
+DELETE=0
+STALE=0
+YES=0
 for arg in "$@"; do
     case "$arg" in
         llama|sd|whisper|piper|tools|k2horizon|spark|bonsai|omnivoice) PROJECTS+=("$arg") ;;
         all) PROJECTS+=(llama sd whisper piper tools) ;;
         rocm|vulkan|cuda|sycl|cpu) BACKENDS+=("$arg") ;;
         update) UPDATE=1 ;;
+        delete) DELETE=1 ;;
+        --stale) STALE=1 ;;
         --clean|-c)  CLEAN=1 ;;
+        -y|--yes)  YES=1 ;;
         -h|--help)
             usage
             exit 0
@@ -178,7 +192,7 @@ for arg in "$@"; do
         *) echo "Unknown arg: $arg (try --help)"; exit 1 ;;
     esac
 done
-[[ ${#PROJECTS[@]} -eq 0 && $UPDATE -eq 0 ]] && PROJECTS=(llama sd whisper piper tools)
+[[ ${#PROJECTS[@]} -eq 0 && $UPDATE -eq 0 && $DELETE -eq 0 ]] && PROJECTS=(llama sd whisper piper tools)
 # BACKENDS stays empty here on purpose: the menu (after the install-dir
 # prompt) or the non-interactive default fills it in before JOBS_LIST is built.
 
@@ -288,13 +302,11 @@ install_prefix() {
     ok "  JayNet's start-model.sh prepends <bin>/../lib automatically)"
 }
 
-# -- Update mode ---------------------------------------------------------------
-# `update` rebuilds exactly what's already built: every source tree/venv under
-# this checkout maps 1:1 to a (project, backend) job. sync_repo pulls latest;
-# the K2 fork re-pins + re-applies its patches by design. Nothing is cloned
-# here — a tree that doesn't exist was never built and stays untouched.
-if [[ $UPDATE -eq 1 ]]; then
-    JOBS_LIST=()
+# -- Existing-build detection ---------------------------------------------------
+# Every source tree/venv under this checkout maps 1:1 to a (project, backend)
+# job. Shared by `update` (what to rebuild) and `delete` (what can go).
+existing_jobs() {
+    local pair
     for pair in \
         "$ROCM_DIR:llama-rocm"           "$VULKAN_DIR:llama-vulkan" \
         "$CUDA_DIR:llama-cuda"           "$SYCL_DIR:llama-sycl" \
@@ -312,10 +324,21 @@ if [[ $UPDATE -eq 1 ]]; then
         "$OMNI_ROCM_DIR:omnivoice-rocm"   "$OMNI_VULKAN_DIR:omnivoice-vulkan" \
         "$OMNI_CUDA_DIR:omnivoice-cuda"   "$OMNI_CPU_DIR:omnivoice-cpu" \
     ; do
-        [[ -d "${pair%%:*}/.git" ]] && JOBS_LIST+=("${pair##*:}")
+        [[ -d "${pair%%:*}/.git" ]] && echo "${pair##*:}"
     done
-    [[ -d "$PIPER_VENV" ]] && JOBS_LIST+=(piper)
-    [[ -d "$TOOLS_VENV/bin" ]] && JOBS_LIST+=(tools)
+    [[ -d "$PIPER_VENV" ]] && echo piper
+    [[ -d "$TOOLS_VENV/bin" ]] && echo tools
+    return 0
+}
+
+# -- Update mode ---------------------------------------------------------------
+# `update` rebuilds exactly what's already built: every source tree/venv under
+# this checkout maps 1:1 to a (project, backend) job. sync_repo pulls latest;
+# the K2 fork re-pins + re-applies its patches by design. Nothing is cloned
+# here — a tree that doesn't exist was never built and stays untouched.
+if [[ $UPDATE -eq 1 ]]; then
+    JOBS_LIST=()
+    while IFS= read -r j; do JOBS_LIST+=("$j"); done < <(existing_jobs)
     [[ ${#JOBS_LIST[@]} -eq 0 ]] \
         && fail "update: no existing builds found under $BASE_DIR — run a normal build first"
     # PROJECTS/BACKENDS only feed the banner + menu from here on; reconstruct
@@ -330,6 +353,181 @@ if [[ $UPDATE -eq 1 ]]; then
     done
     step "Update plan (existing builds): ${JOBS_LIST[*]}"
 fi
+
+# -- Delete mode ---------------------------------------------------------------
+# `delete` removes a build completely: the source tree under this checkout
+# AND its installed artifacts in $BIN_DIR. Removing the TREE is the point —
+# `update` keys on trees, so deleting only the binaries (as done by hand
+# before) left update rebuilding them on the next run.
+if [[ $DELETE -eq 1 ]]; then
+    # Job name -> paths to remove (one per line). Prefix families install as
+    # <family>.<backend>-<tag>/ + a <family>.<backend> symlink; sd installs
+    # flat binaries shared across backends (removed only with the LAST sd
+    # tree); piper/tools are venvs + CLI links (piper voices are downloaded
+    # assets and are KEPT).
+    job_paths() {
+        local job="$1" proj be family src
+        case "$job" in
+            piper) echo "$PIPER_VENV"; [[ -L $BIN_DIR/piper ]] && echo "$BIN_DIR/piper"; return ;;
+            tools) echo "$TOOLS_VENV"; [[ -L $BIN_DIR/hf ]] && echo "$BIN_DIR/hf"; return ;;
+        esac
+        proj="${job%%-*}"; be="${job##*-}"
+        case "$proj" in
+            llama)     src="$BASE_DIR/llama.cpp-$be";              family="llama.cpp" ;;
+            whisper)   src="$BASE_DIR/whisper.cpp-$be";            family="whisper.cpp" ;;
+            sd)        src="$BASE_DIR/stable-diffusion.cpp-$be";   family="" ;;
+            k2horizon) src="$BASE_DIR/llama.cpp-k2horizon-$be";    family="llama.cpp-k2horizon" ;;
+            spark)     src="$BASE_DIR/llama.cpp-spark-$be";        family="llama.cpp-spark" ;;
+            bonsai)    src="$BASE_DIR/llama.cpp-bonsai-$be";       family="llama.cpp-bonsai" ;;
+            omnivoice) src="$BASE_DIR/omnivoice.cpp-$be";          family="omnivoice.cpp" ;;
+            *) return 1 ;;
+        esac
+        echo "$src"
+        [[ -z "$family" ]] && return 0
+        local d
+        for d in "$BIN_DIR/${family}.${be}"-*/; do
+            [[ -d "$d" ]] && echo "${d%/}"
+        done
+        [[ -L "$BIN_DIR/${family}.${be}" || -e "$BIN_DIR/${family}.${be}" ]] \
+            && echo "$BIN_DIR/${family}.${be}"
+        return 0
+    }
+
+    # Running processes holding a path open (exe or mapped libs).
+    procs_using() {
+        local path="$1" p exe
+        for p in /proc/[0-9]*; do
+            exe="$(readlink "$p/exe" 2>/dev/null)" || continue
+            if [[ "$exe" == "$path"* ]]; then
+                echo "${p#/proc/} $(cat "$p/comm" 2>/dev/null)"
+            elif grep -qm1 "$path" "$p/maps" 2>/dev/null; then
+                echo "${p#/proc/} $(cat "$p/comm" 2>/dev/null)"
+            fi
+        done
+        return 0
+    }
+
+    human_size() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "${1}B"; }
+    paths_size() {
+        local t=0 p s
+        for p in "$@"; do
+            s="$(du -sb "$p" 2>/dev/null | cut -f1)"
+            t=$((t + ${s:-0}))
+        done
+        echo "$t"
+    }
+
+    # ---- stale-prefix prune: old versioned dirs, keep current targets ----
+    if [[ $STALE -eq 1 ]]; then
+        STALE_DIRS=()
+        for link in "$BIN_DIR"/*; do
+            [[ -L "$link" ]] || continue
+            tgt="$(readlink "$link")"; base="${link##*/}"
+            [[ "${tgt##*/}" == "$base"-* ]] || continue
+            for d in "$BIN_DIR/$base"-*/; do
+                [[ -d "$d" && "${d%/}" != "$tgt" ]] && STALE_DIRS+=("${d%/}")
+            done
+        done
+        [[ ${#STALE_DIRS[@]} -eq 0 ]] && { ok "no stale versioned prefixes under $BIN_DIR"; exit 0; }
+        step "Stale versioned prefixes (current symlink targets are KEPT):"
+        for d in "${STALE_DIRS[@]}"; do
+            printf "  %-60s %s\n" "$d" "$(human_size "$(du -sb "$d" | cut -f1)")"
+        done
+        echo "  total: $(human_size "$(paths_size "${STALE_DIRS[@]}")")"
+        if [[ $YES -ne 1 ]]; then
+            read -r -p "Delete ${#STALE_DIRS[@]} stale prefixes? [y/N] " ans
+            [[ "$ans" == y || "$ans" == Y ]] || { echo "aborted"; exit 0; }
+        fi
+        rm -rf "${STALE_DIRS[@]}"
+        ok "pruned ${#STALE_DIRS[@]} stale prefixes"
+        exit 0
+    fi
+
+    # ---- job deletion ----
+    ALL_JOBS=()
+    while IFS= read -r j; do ALL_JOBS+=("$j"); done < <(existing_jobs)
+    [[ ${#ALL_JOBS[@]} -eq 0 ]] \
+        && fail "delete: no existing builds found under $BASE_DIR"
+
+    SELECTED=()
+    if [[ ${#PROJECTS[@]} -gt 0 || ${#BACKENDS[@]} -gt 0 ]]; then
+        # Direct selection: project/backend args filter the existing jobs;
+        # an omitted side is a wildcard (`delete llama` = every llama build).
+        for j in "${ALL_JOBS[@]}"; do
+            case "$j" in
+                piper|tools)
+                    [[ ${#PROJECTS[@]} -eq 0 || " ${PROJECTS[*]} " == *" $j "* ]] \
+                        && SELECTED+=("$j") ;;
+                *)  [[ ${#PROJECTS[@]} -eq 0 || " ${PROJECTS[*]} " == *" ${j%%-*} "* ]] \
+                    && [[ ${#BACKENDS[@]} -eq 0 || " ${BACKENDS[*]} " == *" ${j##*-} "* ]] \
+                        && SELECTED+=("$j") ;;
+            esac
+        done
+        [[ ${#SELECTED[@]} -eq 0 ]] \
+            && fail "delete: no existing build matches (present: ${ALL_JOBS[*]})"
+    else
+        [[ -t 0 ]] || fail "delete: no projects given and not interactive"
+        echo "Builds present (space-separated numbers, 'a' = all):"
+        i=1
+        for j in "${ALL_JOBS[@]}"; do
+            mapfile -t _p < <(job_paths "$j")
+            printf "  %2d) %-18s %s\n" "$i" "$j" \
+                "$(human_size "$(paths_size "${_p[@]}")")"
+            i=$((i + 1))
+        done
+        read -r -p "> " pick
+        [[ -z "$pick" ]] && { echo "aborted"; exit 0; }
+        [[ "$pick" == a || "$pick" == A ]] && pick="$(seq -s' ' 1 ${#ALL_JOBS[@]})"
+        for n in $pick; do
+            [[ "$n" =~ ^[0-9]+$ && $n -ge 1 && $n -le ${#ALL_JOBS[@]} ]] \
+                || fail "delete: invalid selection: $n"
+            SELECTED+=("${ALL_JOBS[$((n - 1))]}")
+        done
+    fi
+
+    # Plan: every path, its size, any process holding it open. sd's flat
+    # binaries (sd, sd-cli, sd-server) are shared across sd backends — they
+    # only go once the last sd tree is deleted.
+    sd_going=0; sd_staying=0
+    for j in "${SELECTED[@]}"; do [[ "$j" == sd-* ]] && sd_going=1; done
+    for j in "${ALL_JOBS[@]}"; do
+        [[ "$j" == sd-* && " ${SELECTED[*]} " != *" $j "* ]] && sd_staying=1
+    done
+    step "Delete plan:"
+    PLAN=(); IN_USE=0
+    for j in "${SELECTED[@]}"; do
+        while IFS= read -r p; do PLAN+=("$p"); done < <(job_paths "$j")
+        if [[ "$j" == sd-* ]]; then
+            if [[ $sd_staying -eq 0 ]]; then
+                for f in sd sd-cli sd-server; do
+                    [[ -e "$BIN_DIR/$f" ]] && PLAN+=("$BIN_DIR/$f")
+                done
+            else
+                warn "sd flat binaries ($BIN_DIR/sd{,-cli,-server}) stay: another sd build remains"
+            fi
+        fi
+        [[ "$j" == piper ]] && warn "piper voices in $PIPER_VOICE_DIR are kept (downloaded assets)"
+    done
+    for p in "${PLAN[@]}"; do
+        printf "  %-64s %s\n" "$p" "$(human_size "$(du -sb "$p" 2>/dev/null | cut -f1 || echo 0)")"
+        users="$(procs_using "$p")"
+        if [[ -n "$users" ]]; then
+            IN_USE=1
+            echo -e "${RED}    in use by:${NC} $(echo "$users" | tr '\n' ' ')"
+        fi
+    done
+    echo "  total: $(human_size "$(paths_size "${PLAN[@]}")") over ${#PLAN[@]} paths"
+    [[ $IN_USE -eq 1 ]] \
+        && warn "paths are held by running processes — their binaries keep running, but a restart/swap will fail; stop them first (or -y to delete anyway)"
+    if [[ $YES -ne 1 ]]; then
+        read -r -p "Delete ${#PLAN[@]} paths? [y/N] " ans
+        [[ "$ans" == y || "$ans" == Y ]] || { echo "aborted"; exit 0; }
+    fi
+    rm -rf "${PLAN[@]}"
+    ok "deleted ${#PLAN[@]} paths (${SELECTED[*]}) — \`update\` will no longer touch them"
+    exit 0
+fi
+
 
 # -- Backend selection ----------------------------------------------------------
 # GPU-less projects (piper, tools) skip this entirely. Menu default = vulkan:
