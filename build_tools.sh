@@ -1892,16 +1892,23 @@ preflight() {
             command -v hipcc >/dev/null 2>&1 || fail "hipcc not found -- pacman -S rocm-hip-sdk"
             if ! command -v rocminfo >/dev/null 2>&1; then
                 warn "rocminfo not found -- pacman -S rocminfo (skipping device check)"
-            elif rocminfo 2>/dev/null | grep -q "$AMDGPU_TARGETS"; then
-                local n
-                n=$(rocminfo 2>/dev/null | grep -c "Name:.*${AMDGPU_TARGETS}" || true)
-                ok "rocminfo sees ${n} ${AMDGPU_TARGETS} device(s)"
             else
-                warn "rocminfo doesn't list ${AMDGPU_TARGETS}. Check:"
-                warn "  1. ROCm version supports your GPU (pacman -Qi rocm-hip-runtime)"
-                warn "  2. User in render+video groups: groups | grep -E 'render|video'"
-                warn "  3. amdgpu kernel module loaded: lsmod | grep amdgpu"
-                warn "  4. Wrong target picked? Re-run with AMDGPU_TARGETS=<your gfx>"
+                local n
+                # grep -c reads ALL of rocminfo's output — a `grep -q` here
+                # exits on the first match, rocminfo dies with SIGPIPE, and
+                # pipefail turns the pipeline into a false "not found".
+                # ^  Name anchors on agent blocks (skips the amdgcn target
+                # lines, which would double-count each GPU).
+                n=$(rocminfo 2>/dev/null | grep -cE "^  Name:.*${AMDGPU_TARGETS}" || true)
+                if [[ ${n:-0} -gt 0 ]]; then
+                    ok "rocminfo sees ${n} ${AMDGPU_TARGETS} device(s)"
+                else
+                    warn "rocminfo doesn't list ${AMDGPU_TARGETS}. Check:"
+                    warn "  1. ROCm version supports your GPU (pacman -Qi rocm-hip-runtime)"
+                    warn "  2. User in render+video groups: groups | grep -E 'render|video'"
+                    warn "  3. amdgpu kernel module loaded: lsmod | grep amdgpu"
+                    warn "  4. Wrong target picked? Re-run with AMDGPU_TARGETS=<your gfx>"
+                fi
             fi
             # rocWMMA only matters for llama.cpp (SD has it off intentionally)
             if [[ " ${JOBS_LIST[*]} " == *" llama-rocm "* ]]; then
@@ -1923,9 +1930,12 @@ preflight() {
                && ! ls /usr/{lib,share}/cmake/spirv-headers/*.cmake >/dev/null 2>&1; then
                 warn "SPIRV-Headers CMake config missing -- pacman -S spirv-headers spirv-tools"
             fi
-            if ! ldconfig -p 2>/dev/null | grep -q "libvulkan.so"; then
-                warn "libvulkan.so not found -- pacman -S vulkan-icd-loader"
-            fi
+            # same SIGPIPE+pipefail trap as the rocminfo check above: -q
+            # exits early, the producer dies, the pipeline reports failure.
+            local nv
+            nv=$(ldconfig -p 2>/dev/null | grep -c "libvulkan.so" || true)
+            [[ ${nv:-0} -eq 0 ]] \
+                && warn "libvulkan.so not found -- pacman -S vulkan-icd-loader"
             command -v glslc >/dev/null 2>&1 \
                 || warn "glslc not found -- pacman -S shaderc"
             if ! ls /usr/share/vulkan/icd.d/radeon_icd*.json >/dev/null 2>&1; then
