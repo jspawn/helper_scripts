@@ -1,4 +1,17 @@
-# helper_scripts
+# helper_scripts — ARCHIVED
+
+**Moved:** `build_tools.sh` now ships inside JayNet at
+[`scripts/build_tools.sh`](https://github.com/jspawn/jaynet_orchestrator/blob/master/scripts/build_tools.sh).
+New clones, updates and issues go there. This repo is kept for history only
+(the script here still works standalone, but is no longer updated).
+
+Migrating an existing checkout: run the in-repo script once with
+`BUILD_HOME=<this checkout>` to rebuild these trees in place, or move the
+source trees/venvs into the new default work area `~/jaynet-build`.
+
+---
+
+# helper_scripts (old README)
 
 Build helper and example presets for running local LLM / diffusion / speech tooling — the companion to [JayNet](https://github.com/jspawn/jaynet_orchestrator), but usable on its own.
 
