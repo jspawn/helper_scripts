@@ -18,6 +18,14 @@ llama.cpp-k2horizon-rocm/
 llama.cpp-k2horizon-vulkan/
 llama.cpp-k2horizon-cuda/
 llama.cpp-k2horizon-cpu/
+llama.cpp-spark-rocm/
+llama.cpp-spark-cpu/
+llama.cpp-bonsai-rocm/
+llama.cpp-bonsai-cpu/
+omnivoice.cpp-rocm/
+omnivoice.cpp-vulkan/
+omnivoice.cpp-cuda/
+omnivoice.cpp-cpu/
 # downloaded K2-Horizon patches (re-fetched by build_tools.sh when missing)
 patches/
 stable-diffusion/

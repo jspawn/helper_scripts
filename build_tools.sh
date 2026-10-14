@@ -26,9 +26,9 @@
 #                                         #  tts-server, omnivoice-tts, omnivoice-codec)
 #    ./build_tools.sh update             # rebuild everything already built
 #                                         # (every source tree/venv present —
-#                                         #  syncs to latest, k2horizon keeps
-#                                         #  its pin; add --clean to rebuild
-#                                         #  from scratch)
+#                                         #  vanilla trees sync to latest, the
+#                                         #  forks keep their pinned commits;
+#                                         #  add --clean to rebuild from scratch)
 #    ./build_tools.sh delete             # interactive picker: remove builds
 #                                         #  (source tree + installed prefixes —
 #                                         #   deleting the TREE is what stops
@@ -45,7 +45,7 @@
 #  Special:   update -- rebuild every tree/venv already present (see above)
 #  Backends:  rocm, vulkan, cuda, sycl, cpu
 #             (omitted: menu; non-interactive: vulkan)
-#  Env vars:  JOBS=16                 parallelism (default 32)
+#  Env vars:  JOBS=16                 parallelism (default: nproc)
 #             BIN_DIR=/opt/x         install dir for built binaries (skips prompt;
 #                                        last choice persists in ~/.config/jaynet-build-tools.env)
 #             AMDGPU_TARGETS=gfx1100 AMD gfx target for ROCm builds (skips prompt)
@@ -93,26 +93,36 @@ WHISPER_CPU_DIR="${BASE_DIR}/whisper.cpp-cpu"
 K2_REPO="https://github.com/MBZUAI-IFM/llama.cpp"
 K2_COMMIT="35999d101cf2233fc54f09c3c8d599da7303ce02"
 K2_PATCH_DIR="${BASE_DIR}/patches/k2horizon"
-K2_PATCH_BASE="https://huggingface.co/vincespeed/K2-Horizon-MoVA-36B-A4B-APEX-GGUF/resolve/main/patches"
+# Pinned to a fixed HF revision (not resolve/main) + sha256-checked: these
+# patches are code we apply to a tree we build and run.
+K2_PATCH_BASE="https://huggingface.co/vincespeed/K2-Horizon-MoVA-36B-A4B-APEX-GGUF/resolve/ecdc6f157e7db48bfcafe003d05befd79d28ca0b/patches"
 K2_PATCHES=(0001-fix-k2-horizon-msvc-regex.patch 0002-fix-k2-horizon-parallel-norm.patch)
+declare -A K2_PATCH_SHA256=(
+    [0001-fix-k2-horizon-msvc-regex.patch]=09dea72b9b2cd882322db723edf3a1eb8358439bd18e1ce94bbbae100c72797a
+    [0002-fix-k2-horizon-parallel-norm.patch]=db6028f2d133a0bdcfc69150c455221c565f79bb9202a9eee6aefe38c4bb0825
+)
 K2_ROCM_DIR="${BASE_DIR}/llama.cpp-k2horizon-rocm"
 K2_VULKAN_DIR="${BASE_DIR}/llama.cpp-k2horizon-vulkan"
 K2_CUDA_DIR="${BASE_DIR}/llama.cpp-k2horizon-cuda"
 K2_CPU_DIR="${BASE_DIR}/llama.cpp-k2horizon-cpu"
 # Spark-X2.5 fork: mainline llama.cpp has no spark2_5 arch (hybrid sliding-
 # window attention) — the model card (XHToken/Spark-X2.5-4B) points at the
-# author's fork. No pin, no patches: the fork IS the reference tree, so
-# sync_repo tracks its latest like any other project.
+# author's fork. Pinned to a reviewed commit like K2: everything built here
+# ends up running inside JayNet, so `update` must not silently pull new
+# upstream code. To move the pin: review the fork's new commits, then bump
+# SPARK_COMMIT.
 SPARK_REPO="https://github.com/XHToken/llama.cpp"
+SPARK_COMMIT="4a3635c32fc9f044c2bde9ebeabf50c7e1ec5991"
 SPARK_ROCM_DIR="${BASE_DIR}/llama.cpp-spark-rocm"
 SPARK_CPU_DIR="${BASE_DIR}/llama.cpp-spark-cpu"
 # PrismML fork (prism branch): Ternary-Bonsai models need the custom ternary
 # kernels + Hadamard activation runtime — stock llama.cpp rejects PQ2_0 /
 # PTQ1_0 (model card: prism-ml/Ternary-Bonsai-2-27B-gguf). ROCm works (RDNA3
-# confirmed upstream). No pin, no patches: the prism branch IS the reference
-# tree, synced like any other project.
+# confirmed upstream). Pinned like the other forks (see SPARK above).
 BONSAI_REPO="https://github.com/PrismML-Eng/llama.cpp"
-BONSAI_BRANCH="prism"
+# (the pin is a commit on the fork's prism branch — the ternary kernels live
+# there, the default branch just tracks upstream)
+BONSAI_COMMIT="e3de715222b2667c54a267441159a5729f11155e"
 BONSAI_ROCM_DIR="${BASE_DIR}/llama.cpp-bonsai-rocm"
 BONSAI_CPU_DIR="${BASE_DIR}/llama.cpp-bonsai-cpu"
 # OmniVoice TTS (omnivoice.cpp): GGML port of k2-fsa/OmniVoice — massively
@@ -122,7 +132,9 @@ BONSAI_CPU_DIR="${BASE_DIR}/llama.cpp-bonsai-cpu"
 # GGML_HIP/GGML_VULKAN/GGML_CUDA pass straight through to it (whisper-style),
 # so no upstream ROCm build script is needed. Binaries land in build/ ROOT,
 # not build/bin — install_omni_prefix handles that. NOT part of "all".
+# Pinned to the commit we validated live (see SPARK above for how to bump).
 OMNI_REPO="https://github.com/ServeurpersoCom/omnivoice.cpp"
+OMNI_COMMIT="2c32cd336881ef12fcf69245d0cedce2e4d19d6c"
 OMNI_ROCM_DIR="${BASE_DIR}/omnivoice.cpp-rocm"
 OMNI_VULKAN_DIR="${BASE_DIR}/omnivoice.cpp-vulkan"
 OMNI_CUDA_DIR="${BASE_DIR}/omnivoice.cpp-cuda"
@@ -142,9 +154,10 @@ PIPER_VENV="${BASE_DIR}/piper/.venv"
 PIPER_VOICE_DIR="${PIPER_VOICE_DIR:-${HOME}/jaynet-models/piper}"
 PIPER_VOICE="en_US-lessac-high"
 PIPER_VOICE_BASE="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/high"
-# llm-tools venv: Python tooling for the scripts here (hf-download.sh needs
-# the `hf` CLI). Kept minimal on purpose -- the finetuning stack lives in
-# /srv/finetuning (own requirements.txt, own venv).
+# llm-tools venv: Python tooling for this repo — the `hf` CLI (+ fast xet
+# transfers) for model downloads. JayNet users can also pull models with
+# JayNet's own scripts/pull-model or the admin downloader. Kept minimal on
+# purpose -- the finetuning stack lives elsewhere (own venv).
 TOOLS_VENV="${BASE_DIR}/llm-tools"
 TOOLS_REQUIREMENTS="${BASE_DIR}/requirements.txt"
 # Shared install location for the SD web UI frontend. The Vite project lives
@@ -153,7 +166,7 @@ TOOLS_REQUIREMENTS="${BASE_DIR}/requirements.txt"
 # via --serve-html-path.
 SD_FRONTEND_INSTALL_DIR="${BASE_DIR}/stable-diffusion/web/server/frontend"
 SD_FRONTEND_HTML="${SD_FRONTEND_INSTALL_DIR}/dist/index.html"
-JOBS="${JOBS:-32}"
+JOBS="${JOBS:-$(nproc 2>/dev/null || echo 8)}"
 
 # -- Args -------------------------------------------------------------------
 # Parse projects (llama, sd, whisper, piper, tools, all) and backends
@@ -204,6 +217,9 @@ step() { echo -e "\n${CYAN}${BOLD}==>${NC} ${BOLD}$*${NC}"; }
 ok()   { echo -e "${GREEN}OK${NC} $*"; }
 warn() { echo -e "${YELLOW}!${NC}  $*"; }
 fail() { echo -e "${RED}FAIL${NC} $*"; exit 1; }
+# Install hints name both supported distro families: pkg_hint <pacman pkgs>
+# <apt pkgs> → "sudo pacman -S a b  |  sudo apt install a b".
+pkg_hint() { echo "sudo pacman -S $1  |  sudo apt install $2"; }
 
 # Binaries must also work after the source/build tree is deleted: CMake puts
 # the build/bin dir into RUNPATH, which dies with the tree. Adding $ORIGIN
@@ -333,8 +349,9 @@ existing_jobs() {
 
 # -- Update mode ---------------------------------------------------------------
 # `update` rebuilds exactly what's already built: every source tree/venv under
-# this checkout maps 1:1 to a (project, backend) job. sync_repo pulls latest;
-# the K2 fork re-pins + re-applies its patches by design. Nothing is cloned
+# this checkout maps 1:1 to a (project, backend) job. Vanilla trees sync to
+# latest; the forks re-pin at their reviewed commits (K2 also re-applies its
+# patches) by design. Nothing is cloned
 # here — a tree that doesn't exist was never built and stays untouched.
 if [[ $UPDATE -eq 1 ]]; then
     JOBS_LIST=()
@@ -542,7 +559,7 @@ if [[ ${#BACKENDS[@]} -eq 0 && $UPDATE -eq 0 ]]; then
     if [[ $GPU_PROJECTS -eq 1 && -t 0 ]]; then
         echo "Backends to build (space-separated numbers) [1]:"
         echo "  1) vulkan   AMD / NVIDIA / Intel / mixed -- no vendor SDK (default)"
-        echo "  2) rocm     AMD native (needs ROCm, e.g. pacman -S rocm-hip-sdk)"
+        echo "  2) rocm     AMD native (needs ROCm: Arch rocm-hip-sdk / Ubuntu amdgpu-install)"
         echo "  3) cuda     NVIDIA native (needs the CUDA toolkit)"
         echo "  4) sycl     Intel oneAPI"
         echo "  5) cpu      no GPU -- AVX2/AVX512/AMX via -march=native"
@@ -656,7 +673,7 @@ build_sd_frontend() {
         pm="npm"
     else
         warn "Neither pnpm nor npm found -- skipping web UI build"
-        warn "  Install with: sudo pacman -S pnpm  (or  nodejs npm)"
+        warn "  Install with: $(pkg_hint pnpm pnpm)  (or nodejs/npm via your distro)"
         return 0
     fi
 
@@ -725,14 +742,14 @@ build_llama_rocm() {
         ok "rocWMMA headers found -- enabling HW flash-attn"
     else
         warn "rocWMMA headers NOT found -- building without HW flash-attn"
-        warn "  Install with: sudo pacman -S rocwmma"
+        warn "  Install with: $(pkg_hint rocwmma rocwmma-dev)"
     fi
 
     # Web UI is intentionally disabled: we run llama-server headless behind
     # LiteLLM. Both flags are currently required -- LLAMA_BUILD_UI=OFF alone
     # still triggers asset provisioning (npm build / HF bucket download / stale
     # dist embed), which is exactly what was breaking the build after the
-    # Svelte+PWA web UI rework landed. Drop both flags + `pacman -S nodejs npm`
+    # Svelte+PWA web UI rework landed. Drop both flags + install nodejs/npm
     # if you ever want the embedded browser UI back.
     # TESTS=OFF: we only build 3 targets; skipping tests keeps configure lean
     # (and their broken install rules out of the tree).
@@ -1347,33 +1364,52 @@ build_sd_cpu() {
 }
 
 # -- K2-Horizon fork helpers --------------------------------------------------
-# Clone (if missing) and pin the tree at K2_COMMIT. Unlike sync_repo this
-# never pulls: the model cards validate against one exact commit, and the two
-# patches apply on top of it. Patches leave the tree dirty by design -- a
-# clean tree NOT at the pin is checked out; a dirty tree not at the pin is an
-# unknown state and aborts.
-sync_k2_repo() {
-    local dir="$1"
+# Generic pin: clone if missing, then hold the tree at one reviewed commit.
+# Unlike sync_repo this never pulls: a fork we build and run inside JayNet
+# only moves when a human reviews the new commits and bumps the *_COMMIT var.
+# A clean tree NOT at the pin is checked out; a dirty tree not at the pin is
+# an unknown state and aborts. `recursive` also syncs submodules (omnivoice
+# ships ggml as one).
+pin_repo() {
+    local dir="$1" repo="$2" commit="$3" recursive="${4:-}"
     if [[ ! -d "$dir/.git" ]]; then
-        warn "$dir not found, cloning K2-Horizon fork..."
-        git clone "$K2_REPO" "$dir"
-    fi
-    cd "$dir"
-    if [[ "$(git rev-parse HEAD)" != "$K2_COMMIT" ]]; then
-        if git diff --quiet && git diff --cached --quiet; then
-            step "Pin K2-Horizon fork at ${K2_COMMIT:0:12}"
-            git fetch --quiet origin
-            git checkout --quiet "$K2_COMMIT"
+        warn "$dir not found, cloning..."
+        mkdir -p "$(dirname "$dir")"
+        if [[ "$recursive" == "recursive" ]]; then
+            git clone --recursive "$repo" "$dir"
         else
-            fail "$dir is not at the pinned K2 commit and has local changes -- resolve manually"
+            git clone "$repo" "$dir"
         fi
     fi
-    ok "K2-Horizon fork at $(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)"
+    cd "$dir"
+    if [[ "$(git rev-parse HEAD)" != "$commit" ]]; then
+        if git diff --quiet && git diff --cached --quiet; then
+            step "Pin $(basename "$dir") at ${commit:0:12}"
+            git fetch --quiet origin
+            git checkout --quiet "$commit"
+        else
+            fail "$dir is not at the pinned commit and has local changes -- resolve manually"
+        fi
+    fi
+    if [[ "$recursive" == "recursive" ]]; then
+        git submodule update --init --recursive --quiet
+    fi
+    ok "$(basename "$dir") pinned at $(git rev-parse --short HEAD)"
+}
+
+# K2-Horizon: pinned fork + two model-card patches on top. The patches leave
+# the tree dirty by design -- pin_repo's clean-tree checkout only ever runs
+# before the first patch application on a fresh clone.
+sync_k2_repo() {
+    pin_repo "$1" "$K2_REPO" "$K2_COMMIT"
 }
 
 # Download the two model-card patches once into patches/k2horizon/ and apply
 # them idempotently (skip when already applied, fail when they match neither
 # way -- that means the fork moved and the pin/patches need a revisit).
+# Every patch is sha256-checked against K2_PATCH_SHA256 before use — the
+# download URL is pinned to a fixed HF revision, and the checksum catches
+# both a moved file and a tampered local copy.
 apply_k2_patches() {
     local dir="$1"
     mkdir -p "$K2_PATCH_DIR"
@@ -1385,6 +1421,8 @@ apply_k2_patches() {
             curl -fL --progress-bar -o "$p" "$K2_PATCH_BASE/$f" \
                 || fail "patch download failed: $f"
         fi
+        echo "${K2_PATCH_SHA256[$f]}  $p" | sha256sum --check --quiet \
+            || fail "patch $f fails its sha256 check -- delete $p and re-run to re-download"
         if git -C "$dir" apply --check "$p" 2>/dev/null; then
             git -C "$dir" apply "$p" && ok "applied $f"
         elif git -C "$dir" apply --reverse --check "$p" 2>/dev/null; then
@@ -1534,15 +1572,10 @@ build_k2horizon_cpu() {
 }
 
 # -- Spark-X2.5 fork helpers ----------------------------------------------------
-# Clone if missing, then track latest (no pin — unlike the K2 fork there are
-# no patches to keep applying, and the fork moves with the model releases).
+# Pinned at SPARK_COMMIT (reviewed commit; see the config block for how to
+# bump). No patches — unlike K2 there is nothing to apply on top.
 sync_spark_repo() {
-    local dir="$1"
-    if [[ ! -d "$dir/.git" ]]; then
-        warn "$dir not found, cloning Spark-X2.5 fork..."
-        git clone "$SPARK_REPO" "$dir"
-    fi
-    sync_repo "$dir"
+    pin_repo "$1" "$SPARK_REPO" "$SPARK_COMMIT"
 }
 
 build_spark_rocm() {
@@ -1615,22 +1648,11 @@ build_spark_cpu() {
 }
 
 # -- llama.cpp PrismML/Bonsai fork builds (prism branch; rocm/cpu) -----------
-# Clone (if missing) pinned to the prism BRANCH — the fork's default branch
-# tracks upstream llama.cpp, the ternary kernels live on prism. sync_repo
-# then fast-forwards that branch like any other tree.
+# The ternary kernels live on the prism branch, pinned at BONSAI_COMMIT (a
+# commit on that branch — clone fetches all branches, so the checkout works
+# regardless of the default branch).
 sync_bonsai_repo() {
-    local dir="$1"
-    if [[ ! -d "$dir/.git" ]]; then
-        warn "$dir not found, cloning PrismML fork ($BONSAI_BRANCH branch)..."
-        git clone -b "$BONSAI_BRANCH" "$BONSAI_REPO" "$dir"
-    fi
-    cd "$dir"
-    if [[ "$(git rev-parse --abbrev-ref HEAD)" != "$BONSAI_BRANCH" ]]; then
-        git diff --quiet && git diff --cached --quiet \
-            || fail "$dir not on $BONSAI_BRANCH with local changes — resolve manually"
-        git checkout --quiet "$BONSAI_BRANCH"
-    fi
-    sync_repo "$dir"
+    pin_repo "$1" "$BONSAI_REPO" "$BONSAI_COMMIT"
 }
 
 build_bonsai_rocm() {
@@ -1727,8 +1749,7 @@ install_omni_prefix() {
 }
 
 build_omnivoice_rocm() {
-    check_clone "$OMNI_ROCM_DIR" "$OMNI_REPO" recursive
-    sync_repo "$OMNI_ROCM_DIR" recursive
+    pin_repo "$OMNI_ROCM_DIR" "$OMNI_REPO" "$OMNI_COMMIT" recursive
     cd "$OMNI_ROCM_DIR"
 
     if [[ $CLEAN -eq 1 ]]; then
@@ -1758,8 +1779,7 @@ build_omnivoice_rocm() {
 }
 
 build_omnivoice_vulkan() {
-    check_clone "$OMNI_VULKAN_DIR" "$OMNI_REPO" recursive
-    sync_repo "$OMNI_VULKAN_DIR" recursive
+    pin_repo "$OMNI_VULKAN_DIR" "$OMNI_REPO" "$OMNI_COMMIT" recursive
     cd "$OMNI_VULKAN_DIR"
 
     if [[ $CLEAN -eq 1 ]]; then
@@ -1786,8 +1806,7 @@ build_omnivoice_vulkan() {
 }
 
 build_omnivoice_cuda() {
-    check_clone "$OMNI_CUDA_DIR" "$OMNI_REPO" recursive
-    sync_repo "$OMNI_CUDA_DIR" recursive
+    pin_repo "$OMNI_CUDA_DIR" "$OMNI_REPO" "$OMNI_COMMIT" recursive
     cd "$OMNI_CUDA_DIR"
 
     if [[ $CLEAN -eq 1 ]]; then
@@ -1815,8 +1834,7 @@ build_omnivoice_cuda() {
 }
 
 build_omnivoice_cpu() {
-    check_clone "$OMNI_CPU_DIR" "$OMNI_REPO" recursive
-    sync_repo "$OMNI_CPU_DIR" recursive
+    pin_repo "$OMNI_CPU_DIR" "$OMNI_REPO" "$OMNI_COMMIT" recursive
     cd "$OMNI_CPU_DIR"
 
     if [[ $CLEAN -eq 1 ]]; then
@@ -1851,14 +1869,14 @@ preflight() {
     # Ninja required for SD ROCm build
     if [[ " ${JOBS_LIST[*]} " == *" sd-rocm "* ]]; then
         command -v ninja >/dev/null 2>&1 \
-            || fail "ninja not found (required for SD ROCm build) -- pacman -S ninja"
+            || fail "ninja not found (required for SD ROCm build) -- $(pkg_hint ninja ninja-build)"
     fi
 
     # piper + tools need python3 (venvs); piper also needs curl (voice download)
     if [[ " ${JOBS_LIST[*]} " == *" piper "* || " ${JOBS_LIST[*]} " == *" tools "* ]]; then
         command -v python3 >/dev/null 2>&1 || fail "python3 not found (required for piper/tools)"
         python3 -m venv --help >/dev/null 2>&1 \
-            || fail "python3 venv module missing -- pacman -S python"
+            || fail "python3 venv module missing -- $(pkg_hint python python3-venv)"
     fi
     if [[ " ${JOBS_LIST[*]} " == *" piper "* ]]; then
         command -v curl >/dev/null 2>&1 \
@@ -1875,10 +1893,10 @@ preflight() {
             ok "pnpm present for web UI build"
         elif command -v npm >/dev/null 2>&1; then
             warn "pnpm not found -- web UI will build with npm (slower)"
-            warn "  Recommended: sudo pacman -S pnpm"
+            warn "  Recommended: $(pkg_hint pnpm pnpm)"
         else
             warn "Neither pnpm nor npm found -- web UI will be skipped"
-            warn "  Install with: sudo pacman -S pnpm  (or  nodejs npm)"
+            warn "  Install with: $(pkg_hint pnpm pnpm)  (or nodejs/npm via your distro)"
         fi
     fi
 
@@ -1889,9 +1907,9 @@ preflight() {
 
         if [[ "$backend" == "rocm" && $checked_rocm -eq 0 ]]; then
             checked_rocm=1
-            command -v hipcc >/dev/null 2>&1 || fail "hipcc not found -- pacman -S rocm-hip-sdk"
+            command -v hipcc >/dev/null 2>&1 || fail "hipcc not found -- install ROCm (Arch: rocm-hip-sdk, Ubuntu: AMD amdgpu-install)"
             if ! command -v rocminfo >/dev/null 2>&1; then
-                warn "rocminfo not found -- pacman -S rocminfo (skipping device check)"
+                warn "rocminfo not found -- $(pkg_hint rocminfo rocminfo) (skipping device check)"
             else
                 local n
                 # grep -c reads ALL of rocminfo's output — a `grep -q` here
@@ -1904,7 +1922,7 @@ preflight() {
                     ok "rocminfo sees ${n} ${AMDGPU_TARGETS} device(s)"
                 else
                     warn "rocminfo doesn't list ${AMDGPU_TARGETS}. Check:"
-                    warn "  1. ROCm version supports your GPU (pacman -Qi rocm-hip-runtime)"
+                    warn "  1. Your installed ROCm runtime supports this GPU"
                     warn "  2. User in render+video groups: groups | grep -E 'render|video'"
                     warn "  3. amdgpu kernel module loaded: lsmod | grep amdgpu"
                     warn "  4. Wrong target picked? Re-run with AMDGPU_TARGETS=<your gfx>"
@@ -1914,7 +1932,7 @@ preflight() {
             if [[ " ${JOBS_LIST[*]} " == *" llama-rocm "* ]]; then
                 if [[ ! -f /opt/rocm/include/rocwmma/rocwmma-version.hpp \
                    && ! -f /usr/include/rocwmma/rocwmma-version.hpp ]]; then
-                    warn "rocwmma headers missing -- pacman -S rocwmma (optional but recommended for llama.cpp)"
+                    warn "rocwmma headers missing -- $(pkg_hint rocwmma rocwmma-dev) (optional but recommended for llama.cpp)"
                 fi
             fi
         fi
@@ -1922,38 +1940,38 @@ preflight() {
         if [[ "$backend" == "vulkan" && $checked_vulkan -eq 0 ]]; then
             checked_vulkan=1
             if [[ ! -f /usr/include/vulkan/vulkan.h ]]; then
-                warn "vulkan headers missing -- pacman -S vulkan-headers"
+                warn "vulkan headers missing -- $(pkg_hint vulkan-headers vulkan-headers)"
             else
                 ok "vulkan headers present"
             fi
             if ! ls /usr/{lib,share}/cmake/SPIRV-Headers/*.cmake >/dev/null 2>&1 \
                && ! ls /usr/{lib,share}/cmake/spirv-headers/*.cmake >/dev/null 2>&1; then
-                warn "SPIRV-Headers CMake config missing -- pacman -S spirv-headers spirv-tools"
+                warn "SPIRV-Headers CMake config missing -- $(pkg_hint "spirv-headers spirv-tools" "spirv-headers spirv-tools")"
             fi
             # same SIGPIPE+pipefail trap as the rocminfo check above: -q
             # exits early, the producer dies, the pipeline reports failure.
             local nv
             nv=$(ldconfig -p 2>/dev/null | grep -c "libvulkan.so" || true)
             [[ ${nv:-0} -eq 0 ]] \
-                && warn "libvulkan.so not found -- pacman -S vulkan-icd-loader"
+                && warn "libvulkan.so not found -- $(pkg_hint vulkan-icd-loader libvulkan-dev)"
             command -v glslc >/dev/null 2>&1 \
-                || warn "glslc not found -- pacman -S shaderc"
+                || warn "glslc not found -- $(pkg_hint shaderc glslc)"
             if ! ls /usr/share/vulkan/icd.d/radeon_icd*.json >/dev/null 2>&1; then
-                warn "RADV driver not installed -- pacman -S vulkan-radeon"
+                warn "RADV driver not installed -- $(pkg_hint vulkan-radeon mesa-vulkan-drivers)"
             fi
             if command -v vulkaninfo >/dev/null 2>&1; then
                 local n
                 n=$(vulkaninfo --summary 2>/dev/null | grep -c "deviceName.*Radeon" || true)
                 ok "vulkaninfo sees ${n} Radeon device(s)"
             else
-                warn "vulkaninfo not found -- pacman -S vulkan-tools (optional)"
+                warn "vulkaninfo not found -- $(pkg_hint vulkan-tools vulkan-tools) (optional)"
             fi
         fi
 
         if [[ "$backend" == "cuda" && $checked_cuda -eq 0 ]]; then
             checked_cuda=1
             command -v nvcc >/dev/null 2>&1 \
-                || fail "nvcc not found -- install the CUDA toolkit (pacman -S cuda)"
+                || fail "nvcc not found -- install the CUDA toolkit (Arch: cuda, Ubuntu: nvidia-cuda-toolkit)"
             if command -v nvidia-smi >/dev/null 2>&1; then
                 local n
                 n=$(nvidia-smi --list-gpus 2>/dev/null | grep -c "^GPU" || true)
